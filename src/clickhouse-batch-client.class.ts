@@ -1,41 +1,60 @@
 import { ClickHouseClient } from "@clickhouse/client";
-import { EventToInjest } from "./bulker.class.js";
+import { dayjs } from "./dayjs-utc.js";
+import snakeCase from "lodash.snakecase";
+import { EVENT_TYPE_PROPERTY, EventToInjest } from "./main.js";
 
-enum RequestedColumnType {
-  DATE = "Date",
+const TS_COLUMN_NAME = "timestamp";
+
+export type EventToInjestInTable = Omit<
+  EventToInjest,
+  typeof EVENT_TYPE_PROPERTY
+>;
+
+enum ColumnType {
+  DATE = "DateTime",
   STRING = "String",
-  INTEGER = "Integer",
-  FLOAT = "Float",
-  BOOLEAN = "Boolean",
+  INTEGER = "UInt64",
+  FLOAT = "Float64",
+  BOOLEAN = "UInt8",
 }
 
 type ClickhouseColumnDefinition =
-  | { type: RequestedColumnType.BOOLEAN; default?: boolean }
-  | { type: RequestedColumnType.INTEGER; default?: number }
+  | { type: ColumnType.BOOLEAN; default?: boolean; nullable?: true }
+  | { type: ColumnType.INTEGER; default?: number; nullable?: true }
   | {
-      type: Exclude<
-        RequestedColumnType,
-        RequestedColumnType.BOOLEAN | RequestedColumnType.INTEGER
-      >;
+      type: Exclude<ColumnType, ColumnType.BOOLEAN | ColumnType.INTEGER>; // String, Date, ...
       default?: string;
+      nullable?: true;
     };
 
 type TableName = string;
 type ColumnName = string;
-type ClickhouseSchema = Record<ColumnName, ClickhouseColumnDefinition>;
 
-const CLICKHOUSE_SCHEMA_MAPPING = {
-  [RequestedColumnType.BOOLEAN]: "UInt8",
-  [RequestedColumnType.STRING]: "String",
-  [RequestedColumnType.DATE]: "DateTime",
-  [RequestedColumnType.FLOAT]: "Float64",
-  [RequestedColumnType.INTEGER]: "UInt64",
-} as const;
+type ClickhouseTableSchema = Record<ColumnName, ClickhouseColumnDefinition>;
 
+/**
+ * This class allows to batch-insert rows in a Clickhouse database, by:
+ *
+ * - Analyzing rows we want to batch-insert in the according Clickhouse table:
+ *   These rows must be simple records of [string: <string | Date | number | boolean>],
+ *    and all of these rows must have the same structure.
+ *   Once we analyzed the rows we want to insert, we create or update the Clickhouse table
+ *    schema that is gonna receive the rows.
+ *   When some columns of some of the rows are not undefined, while some of these same columns
+ *    are defined in the other rows, we'll try to injest the column value when it exists,
+ *    and we'll try to set it to NULL when it does not exist.
+ *   Method: `prepareSchema`
+ *
+ * - Insert the rows in the according Clickhouse table:
+ *   Method: `insertRows`
+ *
+ * We can also use method: `prepareSchemaAndInjest`, which does both at same time.
+ *
+ */
 class ClickhouseBatchClient {
   constructor(private readonly clickhouseClient: ClickHouseClient) {}
 
-  async prepareClickhouseTable({
+  async prepareSchema({
     tableName,
     rows,
   }: {
@@ -45,14 +64,14 @@ class ClickhouseBatchClient {
     if (rows.length === 0) {
       throw new Error("errors.no_rows_to_insert");
     }
-    const rowsToInjectSchema = this.getRowsSchema(/*rows[0]*/);
+    const preparedRows = this.prepareRows(rows);
+    const rowsToInjectSchema = this.getRowsMinimumSchema(preparedRows);
     if (Object.keys(rowsToInjectSchema).length === 0) {
       throw new Error("errors.no_columns_found");
     }
     const tableExists = await this.doesTableExist(tableName);
     if (tableExists) {
-      const existingSchema = await this.getClickhouseTableSchema(/*tableName*/);
-
+      const existingSchema = await this.getClickhouseTableSchema(tableName);
       await this.addMissingColumns({
         tableName,
         currentSchema: existingSchema,
@@ -66,35 +85,78 @@ class ClickhouseBatchClient {
     }
   }
 
-  async insert({
+  async insertRows({
     tableName,
     rows,
   }: {
     tableName: TableName;
     rows: EventToInjest[];
   }) {
-    const rowsQueries = this.getClickhouseRowsSql(rows);
-    const firstRowColumns = Object.keys(rows[0]);
-    const sqlQuery = `INSERT INTO ${tableName} (${firstRowColumns.join(",")}) VALUES (${rowsQueries.join("), (")});`;
-    console.debug({ sqlQuery });
-    await this.clickhouseClient.exec({
-      query: sqlQuery,
+    const preparedRows = this.prepareRows(rows);
+    const minimumRowColumns = this.getColsMinimumList(preparedRows);
+    const rowsQueries = this.getClickhouseRowsSql({
+      rowsToInjest: preparedRows,
+      columns: minimumRowColumns,
+    });
+    const sqlQuery = `INSERT INTO ${tableName} (${TS_COLUMN_NAME}, ${minimumRowColumns.join(",")}) VALUES 
+      ('${dayjs().unix()}', ${rowsQueries.join(`),\n ('${dayjs().unix()}', `)});`;
+    try {
+      await this.clickhouseClient.exec({
+        query: sqlQuery,
+      });
+    } catch (err) {
+      console.error(sqlQuery);
+      throw err;
+    }
+  }
+
+  async prepareSchemaAndInjest({
+    tableName,
+    rows,
+  }: {
+    tableName: TableName;
+    rows: EventToInjest[];
+  }) {
+    try {
+      await this.prepareSchema({ tableName, rows });
+      await this.insertRows({ tableName, rows });
+    } catch (err) {
+      throw err;
+    }
+  }
+
+  // --------------------
+  // --------------------
+  // -- Helper methods --
+  // --------------------
+  // --------------------
+
+  // Ensure we gonna use column names in snake_case, and that we aint going to persist "event_type" (${EVENT_TYPE_PROPERTY}) from the redis bull event job.
+  private prepareRows(rows: EventToInjest[]): EventToInjestInTable[] {
+    return rows.map((row) => {
+      const rowWithoutEvenType: EventToInjestInTable = {};
+      for (const eventKey in row) {
+        if (
+          eventKey === EVENT_TYPE_PROPERTY ||
+          eventKey === "__process_single"
+        ) {
+          continue;
+        }
+        rowWithoutEvenType[snakeCase(eventKey)] = row[eventKey];
+      }
+      return rowWithoutEvenType;
     });
   }
 
-  // -------------------
-  // -------------------
-  // Helper methods
-  // -------------------
-  // -------------------
-
-  private getClickhouseColumnsSql(columnsToAdd: ClickhouseSchema) {
+  private getClickhouseColumnsSql(columnsToAdd: ClickhouseTableSchema) {
+    // Build the SQL for CREATE TABLE of colums, or ALTER TABLE columns:
     const addColumnQueries = Object.keys(columnsToAdd).map(
       (columnName: ColumnName) => {
         const column = columnsToAdd[columnName];
-        const type = column.type;
+        const type = column.nullable ? `Nullable(${column.type})` : column.type;
         const defaultValue = column.default;
-        return `${columnName} ${CLICKHOUSE_SCHEMA_MAPPING[type]} ${
+        // ex: [..., `age` UInt64 DEFAULT 18, ...]
+        return `${columnName} ${type} ${
           defaultValue !== undefined
             ? typeof defaultValue === "string"
               ? `DEFAULT '${defaultValue.replace(/'/g, "\\'")}'`
@@ -108,14 +170,36 @@ class ClickhouseBatchClient {
     return addColumnQueries;
   }
 
-  private getClickhouseRowsSql(rowsToInjest: EventToInjest[]) {
-    const addRowsQueries = rowsToInjest.map((row: EventToInjest) => {
-      const columns = Object.keys(row);
+  private getClickhouseRowsSql({
+    rowsToInjest,
+    columns,
+  }: {
+    rowsToInjest: EventToInjestInTable[];
+    columns: string[];
+  }) {
+    const addRowsQueries = rowsToInjest.map((row: EventToInjestInTable) => {
       let rowSql: string[] = [];
       for (const column of columns) {
         const columnContent = row[column];
+        if (columnContent === undefined) {
+          rowSql.push("NULL");
+          continue;
+        }
         rowSql.push(
-          `${typeof columnContent === "number" ? columnContent : typeof columnContent === "string" ? `'${columnContent.replace(/'/g, "\\'")}'` : columnContent === true ? "1" : "0"}`
+          `${
+            columnContent instanceof Date
+              ? dayjs(columnContent).unix()
+              : typeof columnContent === "string" &&
+                  dayjs(columnContent).isValid()
+                ? dayjs(columnContent).unix()
+                : typeof columnContent === "number"
+                  ? columnContent
+                  : typeof columnContent === "string"
+                    ? `'${columnContent.replace(/'/g, "\\'")}'`
+                    : columnContent === true
+                      ? "1"
+                      : "0"
+          }`
         );
       }
       return rowSql.join(","); // (1, 'Alice', 25, '2024-02-27 10:00:00'),
@@ -123,33 +207,140 @@ class ClickhouseBatchClient {
     return addRowsQueries; // [ (1, 'Alice', 25, '2024-02-27 10:00:00'), (2, 'Bob', 30, '2024-02-26 15:30:00') ]
   }
 
+  // ----------------------------------
+  // ----------------------------------
+  // -- Methods that compare schemas --
+  // ----------------------------------
+  // ----------------------------------
+
+  // Get the columns of a set of rows.
+  // We need to crawl all the rows to find all the columns because some of rows might not have all the columns set.
+  private getColsMinimumList(rows: EventToInjestInTable[]) {
+    return [...new Set(rows.map((row) => Object.keys(row)).flat())];
+  }
+
+  // Get the columns of a set of rows, and for each column we get their Clickhouse data-type
+  private getRowsMinimumSchema(
+    rows: EventToInjestInTable[]
+  ): ClickhouseTableSchema {
+    const requestedSchema: ClickhouseTableSchema = {};
+
+    // Some rows may have more columns that the others,
+    //  we need to find the minimum common properties between the rows:
+    const columnsOfRowsToIngest = this.getColsMinimumList(rows);
+    const firstFoundValuePerColumn: Record<
+      string,
+      string | number | Date | boolean
+    > = {};
+    for (const row of rows) {
+      for (const key of Object.keys(row)) {
+        if (firstFoundValuePerColumn[key] === undefined) {
+          firstFoundValuePerColumn[key] = row[key];
+        }
+      }
+      if (
+        Object.keys(firstFoundValuePerColumn).length ===
+        columnsOfRowsToIngest.length
+      ) {
+        // Once we found at least one value for each of the columns we need to ingest
+        break;
+      }
+    }
+
+    for (const property of columnsOfRowsToIngest) {
+      const propertyValue = firstFoundValuePerColumn[property];
+      if (typeof propertyValue === "string") {
+        if (dayjs(propertyValue).isValid()) {
+          requestedSchema[property] = { type: ColumnType.DATE };
+        } else {
+          requestedSchema[property] = { type: ColumnType.STRING };
+        }
+      } else if (typeof propertyValue === "number") {
+        requestedSchema[property] = { type: ColumnType.INTEGER };
+      } else if (propertyValue instanceof Date) {
+        requestedSchema[property] = { type: ColumnType.DATE };
+      } else {
+        // boolean
+        requestedSchema[property] = { type: ColumnType.BOOLEAN };
+      }
+    }
+    return requestedSchema;
+  }
+
+  private async getClickhouseTableSchema(
+    tableName: TableName
+  ): Promise<ClickhouseTableSchema> {
+    const currentSchema = (
+      await (
+        await this.clickhouseClient.query({
+          query: `DESCRIBE ${tableName}`,
+        })
+      ).json<{ name: string; type: ColumnType; default_expression: string }>()
+    ).data;
+
+    /*
+    [
+      {
+        name: 'toto',
+        type: 'String',
+        default_type: '',
+        default_expression: '',
+        comment: '',
+        codec_expression: '',
+        ttl_expression: ''
+      },
+      ...
+    ]
+    */
+    const mappedSchema: ClickhouseTableSchema = {};
+    for (const column of currentSchema) {
+      mappedSchema[column.name] = { type: column.type };
+    }
+    return mappedSchema;
+  }
+
+  // --------------------------------------------
+  // --------------------------------------------
+  // -- Methods that execute SQL in Clickhouse --
+  // --------------------------------------------
+  // --------------------------------------------
+
   private async addMissingColumns({
     tableName,
     currentSchema,
     requestedSchema,
   }: {
     tableName: TableName;
-    currentSchema: ClickhouseSchema;
-    requestedSchema: ClickhouseSchema;
+    currentSchema: ClickhouseTableSchema;
+    requestedSchema: ClickhouseTableSchema;
   }): Promise<void> {
     const missingColumns: Record<ColumnName, ClickhouseColumnDefinition> = {};
+
     for (const requestedColumn in requestedSchema) {
       if (currentSchema[requestedColumn]) {
         // Column exists!
-        // We 'd suppsoed to check the value of the column type !
+        // We 'd suppsoed to check the value of the column type ?
+        // TODO: ?
         continue;
       } else {
-        missingColumns[requestedColumn] = requestedSchema[requestedColumn];
+        // Table exists, we gonna make the columns not required:
+        missingColumns[requestedColumn] = {
+          ...requestedSchema[requestedColumn],
+          nullable: true,
+        };
       }
     }
-
     if (Object.keys(missingColumns).length > 0) {
       const addQueries = this.getClickhouseColumnsSql(missingColumns);
       const sqlQuery = `ALTER TABLE \`${tableName}\` ADD COLUMN ${addQueries.join(", ADD COLUMN ")};`;
       console.debug({ sqlQuery });
-      await this.clickhouseClient.query({
-        query: sqlQuery,
-      });
+      try {
+        await this.clickhouseClient.query({
+          query: sqlQuery,
+        });
+      } catch (err) {
+        throw err;
+      }
     }
     return;
   }
@@ -159,44 +350,22 @@ class ClickhouseBatchClient {
     requestedSchema,
   }: {
     tableName: TableName;
-    requestedSchema: ClickhouseSchema;
+    requestedSchema: ClickhouseTableSchema;
   }): Promise<void> {
     if (Object.keys(requestedSchema).length > 0) {
       const columnsToCreate = this.getClickhouseColumnsSql(requestedSchema);
       const sqlQuery = `CREATE TABLE \`${tableName}\` ( 
-          timestamp DateTime64(6),
+          ${TS_COLUMN_NAME} DateTime64(6),
           ${columnsToCreate.join(",\n")} 
          ) 
          ENGINE = MergeTree() 
-         ORDER BY timestamp;`;
+         ORDER BY ${TS_COLUMN_NAME};`;
       console.debug({ sqlQuery });
       await this.clickhouseClient.query({
         query: sqlQuery,
       });
     }
     return;
-  }
-
-  private getRowsSchema(/*firstRow: EventToInjest*/): ClickhouseSchema {
-    // TODO
-    const requestedSchema: ClickhouseSchema = {
-      toto: { type: RequestedColumnType.BOOLEAN },
-      zozo: { type: RequestedColumnType.STRING, default: "allo" },
-    };
-    return requestedSchema;
-  }
-
-  private async getClickhouseTableSchema() //tableName: TableName
-  : Promise<ClickhouseSchema> {
-    // TODO:
-    /*const currentSchema = await this.clickhouseClient.query({
-      query: `DESCRIBE ${tableName}`,
-    });*/
-    const mappedSchema: ClickhouseSchema = {
-      toto: { type: RequestedColumnType.BOOLEAN },
-      zozo: { type: RequestedColumnType.STRING, default: "allo" },
-    };
-    return mappedSchema;
   }
 
   private async doesTableExist(tableName: string): Promise<boolean> {

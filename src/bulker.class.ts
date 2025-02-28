@@ -1,7 +1,11 @@
 import { ClickHouseClient } from "@clickhouse/client";
 import ClickhouseBatchClient from "./clickhouse-batch-client.class.js";
+import { configDotenv } from "dotenv";
+import { EventToInjest } from "./main.js";
 
-export type EventToInjest = Record<string, string | number | boolean>;
+if (!process.env || Object.keys(process.env).length === 0) {
+  configDotenv();
+}
 
 export type BatchProcessingMetadata = {
   startedAt: number;
@@ -31,17 +35,14 @@ class Bulker {
   }
 
   private currentBatchToProcess: EventToInjest[] = [];
-  process(eventData: EventToInjest & { event_type: string }) {
-    // We need to unset `event_type` that comes from our redis job (to define the clickhouse table name / event name):
-    const eventToInjest = { ...eventData };
-    delete eventToInjest.event_type;
+  enqueue(eventToInjest: EventToInjest) {
     this.currentBatchToProcess.push(eventToInjest);
     console.log("Added to batch", eventToInjest);
   }
 
   private batchProcessingMetadata: BatchProcessingMetadata | null = null;
   private batchProcessing: EventToInjest[] = [];
-  async batch() {
+  async processBatch(onFailed: (failedEvents: EventToInjest[]) => void) {
     if (this.batchProcessing.length > 0) {
       console.log("Already pushing a batch");
       return;
@@ -51,8 +52,9 @@ class Bulker {
       return;
     }
 
-    console.log(`Gonna batch ${this.currentBatchToProcess.length}`);
-
+    console.log(
+      `Gonna batch ${Math.min(this.takeUpToPerBatch, this.currentBatchToProcess.length)}/${this.currentBatchToProcess.length}`
+    );
     this.batchProcessing = this.currentBatchToProcess.splice(
       0,
       this.takeUpToPerBatch
@@ -64,23 +66,30 @@ class Bulker {
     };
 
     console.log("Batch goes...");
-    console.log("Migrate table...");
 
-    await this.clickhouseBatchClient.prepareClickhouseTable({
-      tableName: this.destinationClickhouseTable,
-      rows: this.batchProcessing,
-    });
-    console.log("Migrate done.");
+    try {
+      console.log("Migrate table...");
 
-    this.batchProcessingMetadata.status = "inserting";
+      await this.clickhouseBatchClient.prepareSchema({
+        tableName: this.destinationClickhouseTable,
+        rows: this.batchProcessing,
+      });
+      console.log("Migrate done.");
 
-    console.log("Inserting..");
-    await this.clickhouseBatchClient.insert({
-      tableName: this.destinationClickhouseTable,
-      rows: this.batchProcessing,
-    });
+      this.batchProcessingMetadata.status = "inserting";
 
-    console.log("Inserting done.");
+      console.log("Inserting..");
+      await this.clickhouseBatchClient.insertRows({
+        tableName: this.destinationClickhouseTable,
+        rows: this.batchProcessing,
+      });
+
+      console.log("Inserting done.");
+    } catch (err) {
+      console.error(err);
+      // If an error occur, we dont throw and loose everything, we just gonna reinject the rows we tried to injest:
+      onFailed(this.batchProcessing);
+    }
     this.batchProcessing = [];
     this.batchProcessingMetadata = null;
   }
