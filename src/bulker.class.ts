@@ -37,7 +37,6 @@ class Bulker {
   private currentBatchToProcess: EventToInjest[] = [];
   enqueue(eventToInjest: EventToInjest) {
     this.currentBatchToProcess.push(eventToInjest);
-    console.log("Added to batch", eventToInjest);
   }
 
   private batchProcessingMetadata: BatchProcessingMetadata | null = null;

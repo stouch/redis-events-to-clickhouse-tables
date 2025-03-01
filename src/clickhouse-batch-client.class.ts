@@ -1,9 +1,15 @@
 import { ClickHouseClient } from "@clickhouse/client";
 import { dayjs } from "./dayjs-utc.js";
 import snakeCase from "lodash.snakecase";
-import { EVENT_TYPE_PROPERTY, EventToInjest } from "./main.js";
+import {
+  CLICKHOUSE_NEW_COL_NULLABLE,
+  EVENT_TYPE_PROPERTY,
+  EventToInjest,
+} from "./main.js";
+import { randomUUID } from "crypto";
 
 const TS_COLUMN_NAME = "timestamp";
+const MID_COLUMN_NAME = "message_id";
 
 export type EventToInjestInTable = Omit<
   EventToInjest,
@@ -12,6 +18,7 @@ export type EventToInjestInTable = Omit<
 
 enum ColumnType {
   DATE = "DateTime",
+  DATE64 = "DateTime64(6)",
   STRING = "String",
   INTEGER = "UInt64",
   FLOAT = "Float64",
@@ -98,8 +105,10 @@ class ClickhouseBatchClient {
       rowsToInjest: preparedRows,
       columns: minimumRowColumns,
     });
-    const sqlQuery = `INSERT INTO ${tableName} (${TS_COLUMN_NAME}, ${minimumRowColumns.join(",")}) VALUES 
-      ('${dayjs().unix()}', ${rowsQueries.join(`),\n ('${dayjs().unix()}', `)});`;
+    const sqlQuery = `INSERT INTO ${tableName} 
+      (${minimumRowColumns.join(",")}) VALUES 
+        (${rowsQueries.join(`),
+        (`)});`;
     try {
       await this.clickhouseClient.exec({
         query: sqlQuery,
@@ -180,6 +189,15 @@ class ClickhouseBatchClient {
     const addRowsQueries = rowsToInjest.map((row: EventToInjestInTable) => {
       let rowSql: string[] = [];
       for (const column of columns) {
+        // Among the columns, we got the required columns (timestamp, message_id, ...)
+        if (column === TS_COLUMN_NAME) {
+          rowSql.push(`'${dayjs().unix()}'`);
+          continue;
+        } else if (column === MID_COLUMN_NAME) {
+          rowSql.push(`'${randomUUID()}'`);
+          continue;
+        }
+
         const columnContent = row[column];
         if (columnContent === undefined) {
           rowSql.push("NULL");
@@ -215,8 +233,13 @@ class ClickhouseBatchClient {
 
   // Get the columns of a set of rows.
   // We need to crawl all the rows to find all the columns because some of rows might not have all the columns set.
+  // And we prefix the minimum column list with the two required columns (timestamp, message_id,...)
   private getColsMinimumList(rows: EventToInjestInTable[]) {
-    return [...new Set(rows.map((row) => Object.keys(row)).flat())];
+    return [
+      `${TS_COLUMN_NAME}`,
+      `${MID_COLUMN_NAME}`,
+      ...new Set(rows.map((row) => Object.keys(row)).flat()),
+    ];
   }
 
   // Get the columns of a set of rows, and for each column we get their Clickhouse data-type
@@ -249,7 +272,11 @@ class ClickhouseBatchClient {
 
     for (const property of columnsOfRowsToIngest) {
       const propertyValue = firstFoundValuePerColumn[property];
-      if (typeof propertyValue === "string") {
+      if (property === TS_COLUMN_NAME) {
+        requestedSchema[property] = { type: ColumnType.DATE64 };
+      } else if (property === MID_COLUMN_NAME) {
+        requestedSchema[property] = { type: ColumnType.STRING };
+      } else if (typeof propertyValue === "string") {
         if (dayjs(propertyValue).isValid()) {
           requestedSchema[property] = { type: ColumnType.DATE };
         } else {
@@ -264,6 +291,7 @@ class ClickhouseBatchClient {
         requestedSchema[property] = { type: ColumnType.BOOLEAN };
       }
     }
+
     return requestedSchema;
   }
 
@@ -326,7 +354,7 @@ class ClickhouseBatchClient {
         // Table exists, we gonna make the columns not required:
         missingColumns[requestedColumn] = {
           ...requestedSchema[requestedColumn],
-          nullable: true,
+          nullable: CLICKHOUSE_NEW_COL_NULLABLE ? true : undefined,
         };
       }
     }
@@ -354,9 +382,9 @@ class ClickhouseBatchClient {
   }): Promise<void> {
     if (Object.keys(requestedSchema).length > 0) {
       const columnsToCreate = this.getClickhouseColumnsSql(requestedSchema);
-      const sqlQuery = `CREATE TABLE \`${tableName}\` ( 
-          ${TS_COLUMN_NAME} DateTime64(6),
-          ${columnsToCreate.join(",\n")} 
+      const sqlQuery = `CREATE TABLE \`${tableName}\` (
+          ${columnsToCreate.join(`,
+          `)} 
          ) 
          ENGINE = MergeTree() 
          ORDER BY ${TS_COLUMN_NAME};`;

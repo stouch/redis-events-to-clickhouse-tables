@@ -11,6 +11,8 @@ declare global {
   namespace NodeJS {
     interface ProcessEnv {
       [key: string]: string | undefined;
+      USE_CLICKHOUSE_ASYNC_INSERT: string;
+      CLICKHOUSE_ALTERED_COLUMN_NULLABLE: string;
       TAKE_UP_TO_PER_BATCH: string;
       REDIS_BULL_DB: string;
       REDIS_BULL_EVENTS_QUEUNAME: string;
@@ -58,6 +60,9 @@ if (!process.env.REDIS_JOB_EVENT_TYPE_PROPERTY) {
 
 export const EVENT_TYPE_PROPERTY = process.env.REDIS_JOB_EVENT_TYPE_PROPERTY;
 
+export const CLICKHOUSE_NEW_COL_NULLABLE =
+  process.env.CLICKHOUSE_ALTERED_COLUMN_NULLABLE === "1";
+
 const TAKE_UP_TO_PER_BATCH = +(process.env.TAKE_UP_TO_PER_BATCH || 10);
 const BULKER_REPEAT_INTERVAL_MS =
   +(process.env.BULK_REPEAT_INTERVAL_SEC || 1) * 1000;
@@ -70,6 +75,13 @@ const queue = new Queue(
 const destinationClickhouseClient = createClient({
   url: process.env.DESTINATION_CLICKHOUSE_DB,
   database: process.env.DESTINATION_CLICKHOUSE_DB_NAME,
+  clickhouse_settings:
+    process.env.USE_CLICKHOUSE_ASYNC_INSERT === "1"
+      ? {
+          async_insert: 1,
+          wait_for_async_insert: 1,
+        }
+      : undefined,
 });
 const emergencyBatchClient = new ClickhouseBatchClient(
   destinationClickhouseClient
