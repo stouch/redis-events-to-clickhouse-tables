@@ -11,14 +11,16 @@ declare global {
   namespace NodeJS {
     interface ProcessEnv {
       [key: string]: string | undefined;
-      USE_CLICKHOUSE_ASYNC_INSERT: string;
-      CLICKHOUSE_ALTERED_COLUMN_NULLABLE: string;
-      TAKE_UP_TO_PER_BATCH: string;
+      USE_CLICKHOUSE_ASYNC_INSERT?: "1" | "0";
+      CLICKHOUSE_ALTERED_COLUMN_NULLABLE?: "1" | "0";
+      TAKE_UP_TO_PER_BATCH: string; // Integer
       REDIS_BULL_DB: string;
       REDIS_BULL_EVENTS_QUEUNAME: string;
       DESTINATION_CLICKHOUSE_DB: string;
       DESTINATION_CLICKHOUSE_DB_NAME: string;
-      BULK_REPEAT_INTERVAL_SEC: string;
+      BULK_REPEAT_INTERVAL_SEC: string; // In seconds
+      RE_ENQUEUE_OLD_BULL_EVENTS?: "1" | "0";
+      RE_ENQUEUE_OLD_BULL_EVENTS_JOBNAME?: string;
       REDIS_JOB_EVENT_TYPE_PROPERTY:
         | "event_type"
         | "__event_type"
@@ -119,6 +121,34 @@ if (cluster.isMaster) {
   });
   queue.client.on("ready", () => {
     console.log("Ready");
+  });
+  queue.client.on("error", (err) => {
+    console.error("Queue client error !", err);
+  });
+  queue.on("failed", (job, _err) => {
+    // See .env.sample docs
+    if (process.env.RE_ENQUEUE_OLD_BULL_EVENTS === "1") {
+      if (job && job.name === process.env.RE_ENQUEUE_OLD_BULL_EVENTS_JOBNAME) {
+        // And these jobs have this strange timestamp in seconds: (While ms has timestamp str length >= 13)
+        if (job.timestamp && `${job.timestamp}`.length <= 10) {
+          console.log(
+            `Let's re-enqueue: ${job.name} ${job.id} ${job.data?.event_type}`
+          );
+          const dataToReenqueue = job.data;
+          queue.add(dataToReenqueue, {
+            // TODO: These strange events propably have a delay in seconds too,
+            //  but should we keep "delay"?
+            //  While our goal is to process events which are not supposed to be delayed anyway.
+            // delay: (job as any).delay ? (job as any).delay * 1000  : undefined
+            // For now, we just re-enqueue them.
+          });
+
+          // And request to remove this strange old job:
+          job.remove();
+          console.log("Removed");
+        }
+      }
+    }
   });
   queue.process(async (job): Promise<boolean> => {
     console.log(`Job #${job.id} done by worker ${cluster.worker.id}`);

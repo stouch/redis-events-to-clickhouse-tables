@@ -38,7 +38,7 @@ In the above example, if the Clickhouse table `<some_event_name>` already exists
 
 ### 2. Host this repo
 
-Fork/checkout the repo, setup the `.env` file (using `.env.sample`) to connect the Redis server and the destination Clickhouse database.
+Fork/checkout the repo, setup the `.env` file (using `.env.sample` docs) to connect the Redis server and the destination Clickhouse database.
 
 Then, just run:
 
