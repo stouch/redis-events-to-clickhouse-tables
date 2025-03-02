@@ -51,4 +51,14 @@ npm run buid
 node build/src/inject.js
 ```
 
+In case you want to apply some transformation to your events, override the `src/transform.ts` file. (see docker-compose..yml)
+
+**Alternative: Host this repo with Docker**
+
+Check the _environment_ variables in `docker-compose.yml`, and just run:
+
+```bash
+docker compose up -d
+```
+
 ### 3. We're done 🥳, track your Clickhouse database events !

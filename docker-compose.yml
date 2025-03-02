@@ -1,0 +1,19 @@
+version: "3.8"
+
+services:
+  app:
+    build: .
+    env_file: ./.env
+    environment:
+    - DESTINATION_CLICKHOUSE_DB=http://host.docker.internal:8123
+    - DESTINATION_CLICKHOUSE_DB_NAME=events_bull
+    - REDIS_BULL_DB=redis://host.docker.internal:6379
+    - REDIS_BULL_EVENTS_QUEUNAME=event-track
+    - REDIS_JOB_EVENT_TYPE_PROPERTY=event_type
+    - BULK_REPEAT_INTERVAL_SEC=5
+    - TAKE_UP_TO_PER_BATCH=100
+    - USE_CLICKHOUSE_ASYNC_INSERT=1
+    - CLICKHOUSE_NEW_COL_NULLABLE=0
+    - RE_ENQUEUE_OLD_BULL_EVENTS=0
+    - RE_ENQUEUE_OLD_BULL_EVENTS_JOBNAME=
+    command: ["node", "/app/build/src/main.js"]

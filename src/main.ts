@@ -31,13 +31,10 @@ declare global {
 }
 
 // Define type of the redis job events payload:
+export type EventData = Record<string, string | number | boolean | Date>;
 export type EventToInjest = {
   [key in typeof process.env.REDIS_JOB_EVENT_TYPE_PROPERTY]: string;
-} & { __process_single?: true } & Record<
-    // In case the
-    string,
-    string | number | boolean | Date
-  >;
+} & { __process_single?: true } & EventData;
 
 if (
   !process.env.DESTINATION_CLICKHOUSE_DB ||
@@ -165,7 +162,7 @@ if (cluster.isMaster) {
     }
 
     if (eventData.__process_single === true) {
-      console.log(
+      console.debug(
         `Single failed event to process... Attempt made: ${job.attemptsMade}. ID: ${job.id}`
       );
       try {
@@ -175,7 +172,7 @@ if (cluster.isMaster) {
           tableName: eventName,
           rows: [eventData],
         });
-        console.log(`Single event success. ID: ${job.id}`);
+        console.debug(`Single event success. ID: ${job.id}`);
       } catch (err) {
         console.error(err);
         throw err; // Throw error, and the job.backoff strategy is applied (see the below code of bulk processing).

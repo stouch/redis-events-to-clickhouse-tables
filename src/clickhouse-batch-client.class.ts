@@ -4,23 +4,22 @@ import snakeCase from "lodash.snakecase";
 import {
   CLICKHOUSE_NEW_COL_NULLABLE,
   EVENT_TYPE_PROPERTY,
+  EventData,
   EventToInjest,
 } from "./main.js";
 import { randomUUID } from "crypto";
+import { transform } from "./transform.js";
 
 const TS_COLUMN_NAME = "timestamp";
 const MID_COLUMN_NAME = "message_id";
 
-export type EventToInjestInTable = Omit<
-  EventToInjest,
-  typeof EVENT_TYPE_PROPERTY
->;
+export type EventToInjestInTable = EventData;
 
 enum ColumnType {
   DATE = "DateTime",
   DATE64 = "DateTime64(6)",
   STRING = "String",
-  INTEGER = "UInt64",
+  INTEGER = "Int64",
   FLOAT = "Float64",
   BOOLEAN = "UInt8",
 }
@@ -141,9 +140,9 @@ class ClickhouseBatchClient {
   // --------------------
 
   // Ensure we gonna use column names in snake_case, and that we aint going to persist "event_type" (${EVENT_TYPE_PROPERTY}) from the redis bull event job.
-  private prepareRows(rows: EventToInjest[]): EventToInjestInTable[] {
+  private prepareRows(rows: EventToInjest[]): EventData[] {
     return rows.map((row) => {
-      const rowWithoutEvenType: EventToInjestInTable = {};
+      const rowWithoutEvenType: EventData = {};
       for (const eventKey in row) {
         if (
           eventKey === EVENT_TYPE_PROPERTY ||
@@ -151,9 +150,10 @@ class ClickhouseBatchClient {
         ) {
           continue;
         }
-        rowWithoutEvenType[snakeCase(eventKey)] = row[eventKey];
+        const snakifiedKey: string = snakeCase<string>(eventKey);
+        rowWithoutEvenType[snakifiedKey] = row[eventKey];
       }
-      return rowWithoutEvenType;
+      return transform(rowWithoutEvenType);
     });
   }
 
@@ -278,14 +278,14 @@ class ClickhouseBatchClient {
         requestedSchema[property] = { type: ColumnType.STRING };
       } else if (typeof propertyValue === "string") {
         if (dayjs(propertyValue).isValid()) {
-          requestedSchema[property] = { type: ColumnType.DATE };
+          requestedSchema[property] = { type: ColumnType.DATE64 };
         } else {
           requestedSchema[property] = { type: ColumnType.STRING };
         }
       } else if (typeof propertyValue === "number") {
         requestedSchema[property] = { type: ColumnType.INTEGER };
       } else if (propertyValue instanceof Date) {
-        requestedSchema[property] = { type: ColumnType.DATE };
+        requestedSchema[property] = { type: ColumnType.DATE64 };
       } else {
         // boolean
         requestedSchema[property] = { type: ColumnType.BOOLEAN };
