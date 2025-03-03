@@ -278,7 +278,17 @@ class ClickhouseBatchClient {
   // We need to crawl all the rows to find all the columns because some of rows might not have all the columns set.
   // And we prefix the minimum column list with the two required columns (timestamp, message_id,...)
   private getColsMinimumList(rows: EventToInjestInTable[]) {
-    return [...new Set(rows.map((row) => Object.keys(row)).flat())];
+    return [
+      // Deduplicated columns from all the rows
+      ...new Set(
+        rows
+          .map((row) =>
+            // For each row, we only find columns which have a value !== undefined:
+            Object.keys(row).filter((rowColumn) => row[rowColumn] !== undefined)
+          )
+          .flat()
+      ),
+    ];
   }
 
   // Get the columns of a set of rows, and for each column we get their Clickhouse data-type
