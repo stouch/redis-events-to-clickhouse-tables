@@ -200,8 +200,13 @@ class ClickhouseBatchClient {
   // Ensure we gonna use column names in snake_case, and that we aint going to persist "event_type" (${EVENT_TYPE_PROPERTY}) from the redis bull event job.
   private prepareRows(rows: EventToInjest[]): Record<string, EventDataValue>[] {
     return rows.map((row) => {
+      const rowWithPrimaryKey = {
+        ...this.prepareRowColumns(row),
+        [`${TS_COLUMN_NAME}`]: dayjs().toDate(),
+        [`${MID_COLUMN_NAME}`]: `${randomUUID()}`,
+      };
       // Apply the custom-transform (if it's defined):
-      return transform(this.prepareRowColumns(row));
+      return transform(rowWithPrimaryKey);
     });
   }
 
@@ -237,15 +242,6 @@ class ClickhouseBatchClient {
     const addRowsQueries = rowsData.map((row: EventToInjestInTable) => {
       let rowSql: string[] = [];
       for (const column of columns) {
-        // Among the columns, we got the required columns (timestamp, message_id, ...)
-        if (column === TS_COLUMN_NAME) {
-          rowSql.push(`'${dayjs().unix()}'`);
-          continue;
-        } else if (column === MID_COLUMN_NAME) {
-          rowSql.push(`'${randomUUID()}'`);
-          continue;
-        }
-
         const columnContent = row[column];
         if (columnContent === undefined) {
           rowSql.push("NULL");
@@ -282,11 +278,7 @@ class ClickhouseBatchClient {
   // We need to crawl all the rows to find all the columns because some of rows might not have all the columns set.
   // And we prefix the minimum column list with the two required columns (timestamp, message_id,...)
   private getColsMinimumList(rows: EventToInjestInTable[]) {
-    return [
-      `${TS_COLUMN_NAME}`,
-      `${MID_COLUMN_NAME}`,
-      ...new Set(rows.map((row) => Object.keys(row)).flat()),
-    ];
+    return [...new Set(rows.map((row) => Object.keys(row)).flat())];
   }
 
   // Get the columns of a set of rows, and for each column we get their Clickhouse data-type
@@ -319,11 +311,7 @@ class ClickhouseBatchClient {
 
     for (const property of columnsOfRowsToIngest) {
       const propertyValue = firstFoundValuePerColumn[property];
-      if (property === TS_COLUMN_NAME) {
-        requestedSchema[property] = { type: ColumnType.DATE64 };
-      } else if (property === MID_COLUMN_NAME) {
-        requestedSchema[property] = { type: ColumnType.STRING };
-      } else if (typeof propertyValue === "string") {
+      if (typeof propertyValue === "string") {
         if (isDateString(propertyValue)) {
           requestedSchema[property] = { type: ColumnType.DATE64 };
         } else {
