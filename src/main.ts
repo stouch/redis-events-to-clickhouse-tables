@@ -145,9 +145,6 @@ if (cluster.isMaster) {
       if (job && job.name === process.env.RE_ENQUEUE_OLD_BULL_EVENTS_JOBNAME) {
         // And these jobs have this strange timestamp in seconds: (While ms has timestamp str length >= 13)
         if (job.timestamp && `${job.timestamp}`.length <= 10) {
-          console.log(
-            `Let's re-enqueue: ${job.name} ${job.id} ${job.data?.event_type}`
-          );
           const dataToReenqueue = job.data;
           queue.add(dataToReenqueue, {
             // TODO: These strange events propably have a delay in seconds too,
@@ -159,13 +156,12 @@ if (cluster.isMaster) {
 
           // And request to remove this strange old job:
           job.remove();
-          console.log("Removed");
         }
       }
     }
   });
   queue.process(async (job): Promise<boolean> => {
-    console.log(`Job #${job.id} done by worker ${cluster.worker.id}`);
+    // console.log(`Job #${job.id} done by worker ${cluster.worker.id}`);
 
     // An event is a simple Record<string, string | boolean | Date | number>
     // The Record keys as supposed to be in snake_case (if they're not, they gonna be converted):
@@ -223,9 +219,6 @@ if (cluster.isMaster) {
       bulkers[eventName].processBatch((failedEvents) => {
         // Here is the way we process the failed events:
         //  These are gonna be spread in the future, using an unitary processing, because it's too hard to split sub-batches of them:
-        console.log(
-          `A batch of ${eventName} failed! We gonna split its events to process them later, and without bulking`
-        );
         const failDelayMs = 2 * 1000;
         for (const failedEvent of failedEvents) {
           queue.add(

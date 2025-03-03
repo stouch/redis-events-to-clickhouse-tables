@@ -43,7 +43,6 @@ class Bulker {
   private batchProcessing: EventToInjest[] = [];
   async processBatch(onFailed: (failedEvents: EventToInjest[]) => void) {
     if (this.batchProcessing.length > 0) {
-      console.log("Already pushing a batch");
       return;
     }
     if (this.currentBatchToProcess.length === 0) {
@@ -64,26 +63,15 @@ class Bulker {
       status: "creating_updating_table",
     };
 
-    console.log("Batch goes...");
-
     try {
-      console.log("Migrate table...");
-
       await this.clickhouseBatchClient.prepareSchema({
         tableName: this.destinationClickhouseTable,
         rows: this.batchProcessing,
       });
-      console.log("Migrate done.");
 
       this.batchProcessingMetadata.status = "inserting";
 
-      console.log("Inserting..");
-      await this.clickhouseBatchClient.insertRows({
-        tableName: this.destinationClickhouseTable,
-        rows: this.batchProcessing,
-      });
-
-      console.log("Inserting done.");
+      await this.clickhouseBatchClient.insertRows();
     } catch (err) {
       console.error(err);
       // If an error occur, we dont throw and loose everything, we just gonna reinject the rows we tried to injest:

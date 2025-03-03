@@ -64,7 +64,22 @@ type ClickhouseTableSchema = Record<ColumnName, ClickhouseColumnDefinition>;
  *
  */
 class ClickhouseBatchClient {
-  constructor(private readonly clickhouseClient: ClickHouseClient) {}
+  private preparedSchema: {
+    table: string;
+    schema: ClickhouseTableSchema;
+  } | null = null;
+  private preparedRows: Record<string, EventDataValue>[] | null = null;
+
+  constructor(private readonly clickhouseClient: ClickHouseClient) {
+    this.preparedSchema = null;
+    this.preparedRows = null;
+  }
+
+  // --------------------
+  // --------------------
+  // -- Public methods --
+  // --------------------
+  // --------------------
 
   async prepareSchema({
     tableName,
@@ -76,45 +91,56 @@ class ClickhouseBatchClient {
     if (rows.length === 0) {
       throw new Error("errors.no_rows_to_insert");
     }
-    const preparedRows = this.prepareRows(rows);
-    const rowsToInjectSchema = this.getRowsMinimumSchema(preparedRows);
-    if (Object.keys(rowsToInjectSchema).length === 0) {
+    this.preparedRows = this.prepareRows(rows);
+    const requestedSchema = this.getRowsMinimumSchema(this.preparedRows);
+    if (Object.keys(requestedSchema).length === 0) {
       throw new Error("errors.no_columns_found");
     }
     const tableExists = await this.doesTableExist(tableName);
     if (tableExists) {
       const existingSchema = await this.getClickhouseTableSchema(tableName);
-      await this.addMissingColumns({
-        tableName,
-        currentSchema: existingSchema,
-        requestedSchema: rowsToInjectSchema,
-      });
+
+      this.preparedSchema = {
+        table: tableName,
+        schema: await this.addMissingColumns({
+          tableName,
+          currentSchema: existingSchema,
+          // In `addMissingColumns`, we may update `requestedSchema` if the `existingSchema` is a bit different
+          //  for example the requested DateTime64(6) is probably just a DateTime (see `addMissingColumns`)
+          requestedSchema: requestedSchema,
+        }),
+      };
     } else {
       await this.createTable({
         tableName,
-        requestedSchema: rowsToInjectSchema,
+        requestedSchema: requestedSchema,
       });
+
+      this.preparedSchema = { table: tableName, schema: requestedSchema };
     }
   }
 
-  async insertRows({
-    tableName,
-    rows,
-  }: {
-    tableName: TableName;
-    rows: EventToInjest[];
-  }) {
-    const preparedRows = this.prepareRows(rows);
-    const minimumRowColumns = this.getColsMinimumList(preparedRows);
+  async insertRows() {
+    if (this.preparedSchema === null) {
+      throw new Error("errors.no_prepared_schema");
+    }
+    if (this.preparedRows === null) {
+      throw new Error("errors.no_prepared_schema");
+    }
     const rowsQueries = this.getClickhouseRowsSql({
-      rowsData: preparedRows,
-      columns: minimumRowColumns,
+      rowsData: this.preparedRows,
+      requestedSchema: this.preparedSchema.schema,
     });
-    const sqlQuery = `INSERT INTO ${tableName} 
-      (${minimumRowColumns.join(",")}) VALUES 
+    const sqlQuery = `INSERT INTO ${this.preparedSchema.table} 
+      (${Object.keys(this.preparedSchema.schema).join(",")}) VALUES 
         (${rowsQueries.join(`),
         (`)});`;
     try {
+      // Ensure we waint going to double-insert:
+      this.preparedRows = null;
+      this.preparedSchema = null;
+
+      // And start the INSERT INTO:
       await this.clickhouseClient.exec({
         query: sqlQuery,
       });
@@ -133,7 +159,7 @@ class ClickhouseBatchClient {
   }) {
     try {
       await this.prepareSchema({ tableName, rows });
-      await this.insertRows({ tableName, rows });
+      await this.insertRows();
     } catch (err) {
       throw err;
     }
@@ -234,25 +260,30 @@ class ClickhouseBatchClient {
 
   private getClickhouseRowsSql({
     rowsData,
-    columns,
+    requestedSchema,
   }: {
     rowsData: EventToInjestInTable[];
-    columns: string[];
+    requestedSchema: ClickhouseTableSchema;
   }) {
     const addRowsQueries = rowsData.map((row: EventToInjestInTable) => {
       let rowSql: string[] = [];
-      for (const column of columns) {
+      for (const column in requestedSchema) {
         const columnContent = row[column];
         if (columnContent === undefined) {
           rowSql.push("NULL");
           continue;
         }
+        const colType = requestedSchema[column].type;
+        const dateFormat =
+          colType === ColumnType.DATE64
+            ? "YYYY-MM-DD HH:mm:ss.SSS"
+            : "YYYY-MM-DD HH:mm:ss";
         rowSql.push(
           `${
             columnContent instanceof Date
-              ? dayjs(columnContent).unix()
+              ? `'${dayjs(columnContent).format(dateFormat)}'`
               : typeof columnContent === "string" && isDateString(columnContent)
-                ? dayjs(columnContent).unix()
+                ? `'${dayjs(columnContent).format(dateFormat)}'`
                 : typeof columnContent === "number"
                   ? columnContent
                   : typeof columnContent === "string"
@@ -263,9 +294,9 @@ class ClickhouseBatchClient {
           }`
         );
       }
-      return rowSql.join(","); // (1, 'Alice', 25, '2024-02-27 10:00:00'),
+      return rowSql.join(","); // (1, 'Alice', 25, '2024-02-27 10:00:00.000'),
     });
-    return addRowsQueries; // [ (1, 'Alice', 25, '2024-02-27 10:00:00'), (2, 'Bob', 30, '2024-02-26 15:30:00') ]
+    return addRowsQueries; // [ (1, 'Alice', 25, '2024-02-27 10:00:00.000'), (2, 'Bob', 30, '2024-02-26 15:30:00.000') ]
   }
 
   // ----------------------------------
@@ -390,14 +421,12 @@ class ClickhouseBatchClient {
     tableName: TableName;
     currentSchema: ClickhouseTableSchema;
     requestedSchema: ClickhouseTableSchema;
-  }): Promise<void> {
+  }): Promise<ClickhouseTableSchema> {
     const missingColumns: Record<ColumnName, ClickhouseColumnDefinition> = {};
-
     for (const requestedColumn in requestedSchema) {
       if (currentSchema[requestedColumn]) {
         // Column exists!
         // We 'd suppsoed to check the value of the column type ?
-        // TODO: ?
         continue;
       } else {
         // Table exists, we gonna make the columns not required:
@@ -419,7 +448,18 @@ class ClickhouseBatchClient {
         throw err;
       }
     }
-    return;
+
+    // Check corner-case of existing column of DateTime in a different format (DateTime64(6) -> DateTime):
+    Object.keys(requestedSchema).map((column) => {
+      if (
+        currentSchema[column] &&
+        currentSchema[column].type === ColumnType.DATE &&
+        requestedSchema[column].type === ColumnType.DATE64
+      ) {
+        requestedSchema[column].type = currentSchema[column].type;
+      }
+    });
+    return requestedSchema;
   }
 
   private async createTable({
