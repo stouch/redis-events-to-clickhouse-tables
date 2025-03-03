@@ -10,6 +10,7 @@ import {
 } from "./main.js";
 import { randomUUID } from "crypto";
 import { transform } from "./transform.js";
+import { isDateString } from "./utils.js";
 
 const TS_COLUMN_NAME = "timestamp";
 const MID_COLUMN_NAME = "message_id";
@@ -102,7 +103,7 @@ class ClickhouseBatchClient {
     const preparedRows = this.prepareRows(rows);
     const minimumRowColumns = this.getColsMinimumList(preparedRows);
     const rowsQueries = this.getClickhouseRowsSql({
-      rowsToInjest: preparedRows,
+      rowsData: preparedRows,
       columns: minimumRowColumns,
     });
     const sqlQuery = `INSERT INTO ${tableName} 
@@ -223,13 +224,13 @@ class ClickhouseBatchClient {
   }
 
   private getClickhouseRowsSql({
-    rowsToInjest,
+    rowsData,
     columns,
   }: {
-    rowsToInjest: EventToInjestInTable[];
+    rowsData: EventToInjestInTable[];
     columns: string[];
   }) {
-    const addRowsQueries = rowsToInjest.map((row: EventToInjestInTable) => {
+    const addRowsQueries = rowsData.map((row: EventToInjestInTable) => {
       let rowSql: string[] = [];
       for (const column of columns) {
         // Among the columns, we got the required columns (timestamp, message_id, ...)
@@ -250,8 +251,7 @@ class ClickhouseBatchClient {
           `${
             columnContent instanceof Date
               ? dayjs(columnContent).unix()
-              : typeof columnContent === "string" &&
-                  dayjs(columnContent).isValid()
+              : typeof columnContent === "string" && isDateString(columnContent)
                 ? dayjs(columnContent).unix()
                 : typeof columnContent === "number"
                   ? columnContent
@@ -320,7 +320,7 @@ class ClickhouseBatchClient {
       } else if (property === MID_COLUMN_NAME) {
         requestedSchema[property] = { type: ColumnType.STRING };
       } else if (typeof propertyValue === "string") {
-        if (dayjs(propertyValue).isValid()) {
+        if (isDateString(propertyValue)) {
           requestedSchema[property] = { type: ColumnType.DATE64 };
         } else {
           requestedSchema[property] = { type: ColumnType.STRING };
