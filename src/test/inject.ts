@@ -20,6 +20,11 @@ queue.add(
 
 queue.add({
   event_type: "event_session",
+  objectMoche: {
+    profond: 1,
+    dest: true,
+  },
+  manger: ["dupain"],
   "ba cest un": "test",
   toto: true,
   zozo: "yolo",
@@ -31,6 +36,7 @@ queue.add({
   momo: "02/02/2045",
 });
 
+/*
 const run = async () => {
   while (true) {
     queue.add({
@@ -52,3 +58,5 @@ const run = async () => {
 };
 
 run();
+
+*/

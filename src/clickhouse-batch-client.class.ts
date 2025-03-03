@@ -4,8 +4,9 @@ import snakeCase from "lodash.snakecase";
 import {
   CLICKHOUSE_NEW_COL_NULLABLE,
   EVENT_TYPE_PROPERTY,
-  EventData,
+  EventDataValue,
   EventToInjest,
+  isRecordOfEventData,
 } from "./main.js";
 import { randomUUID } from "crypto";
 import { transform } from "./transform.js";
@@ -13,7 +14,7 @@ import { transform } from "./transform.js";
 const TS_COLUMN_NAME = "timestamp";
 const MID_COLUMN_NAME = "message_id";
 
-export type EventToInjestInTable = EventData;
+export type EventToInjestInTable = Record<string, EventDataValue>;
 
 enum ColumnType {
   DATE = "DateTime",
@@ -139,21 +140,63 @@ class ClickhouseBatchClient {
   // --------------------
   // --------------------
 
-  // Ensure we gonna use column names in snake_case, and that we aint going to persist "event_type" (${EVENT_TYPE_PROPERTY}) from the redis bull event job.
-  private prepareRows(rows: EventToInjest[]): EventData[] {
-    return rows.map((row) => {
-      const rowWithoutEvenType: EventData = {};
-      for (const eventKey in row) {
-        if (
-          eventKey === EVENT_TYPE_PROPERTY ||
-          eventKey === "__process_single"
-        ) {
-          continue;
-        }
-        const snakifiedKey: string = snakeCase<string>(eventKey);
-        rowWithoutEvenType[snakifiedKey] = row[eventKey];
+  /*
+   * Prepare a 1-dimension row from an event:
+   * eg:
+   *  {
+   *     "event_type": "<clickhouse table name>",
+   *     "__process_single": true,
+   *     "someTest": "value",
+   *     "someKey": ["withArray", "value"],
+   *     "correct_case": {"subRecord": "withValue"}
+   *  }
+   *  becomes, once prepared, :
+   *  {
+   *     "some_test": "value",
+   *     "some_key_0": "withArray",
+   *     "some_key_1": "value",
+   *     "correct_case_sub_record": "withValue"
+   *  }
+   */
+  private prepareRowColumns(
+    rowColumnValues: EventToInjest
+  ): Record<string, EventDataValue> {
+    const rowWithoutEvenType: Record<string, EventDataValue> = {};
+    // For each column:
+    for (const eventKey in rowColumnValues) {
+      // First exclude the forbidden column name:
+      if (eventKey === EVENT_TYPE_PROPERTY || eventKey === "__process_single") {
+        continue;
       }
-      return transform(rowWithoutEvenType);
+      // And parse array or sub records:
+      if (Array.isArray(rowColumnValues[eventKey])) {
+        const rowValues: EventDataValue[] = rowColumnValues[eventKey];
+        rowValues.map((rowValue, idx) => {
+          const snakifiedKey: string = snakeCase<string>(eventKey);
+          rowWithoutEvenType[`${snakifiedKey}_${idx}`] = rowValue;
+        });
+      } else if (isRecordOfEventData(rowColumnValues[eventKey])) {
+        Object.keys(rowColumnValues[eventKey]).map((eachRecordKey) => {
+          const snakifiedKey: string = snakeCase<string>(
+            `${eventKey}_${eachRecordKey}`
+          );
+          rowWithoutEvenType[snakifiedKey] =
+            rowColumnValues[eventKey][eachRecordKey];
+        });
+      } else {
+        const rowValue: EventDataValue = rowColumnValues[eventKey];
+        const snakifiedKey: string = snakeCase<string>(eventKey);
+        rowWithoutEvenType[snakifiedKey] = rowValue;
+      }
+    }
+    return rowWithoutEvenType;
+  }
+
+  // Ensure we gonna use column names in snake_case, and that we aint going to persist "event_type" (${EVENT_TYPE_PROPERTY}) from the redis bull event job.
+  private prepareRows(rows: EventToInjest[]): Record<string, EventDataValue>[] {
+    return rows.map((row) => {
+      // Apply the custom-transform (if it's defined):
+      return transform(this.prepareRowColumns(row));
     });
   }
 
