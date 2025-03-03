@@ -17,6 +17,8 @@ declare global {
       REDIS_BULL_DB: string;
       REDIS_BULL_EVENTS_QUEUNAME: string;
       DESTINATION_CLICKHOUSE_DB: string;
+      DESTINATION_CLICKHOUSE_DB_USER?: string;
+      DESTINATION_CLICKHOUSE_DB_PW?: string;
       DESTINATION_CLICKHOUSE_DB_NAME: string;
       BULK_REPEAT_INTERVAL_SEC: string; // In seconds
       RE_ENQUEUE_OLD_BULL_EVENTS?: "1" | "0";
@@ -73,6 +75,8 @@ const queue = new Queue(
 
 const destinationClickhouseClient = createClient({
   url: process.env.DESTINATION_CLICKHOUSE_DB,
+  username: process.env.DESTINATION_CLICKHOUSE_DB_USER || undefined,
+  password: process.env.DESTINATION_CLICKHOUSE_DB_PW || undefined,
   database: process.env.DESTINATION_CLICKHOUSE_DB_NAME,
   clickhouse_settings:
     process.env.USE_CLICKHOUSE_ASYNC_INSERT === "1"
