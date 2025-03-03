@@ -10,7 +10,7 @@ import {
 } from "./main.js";
 import { randomUUID } from "crypto";
 import { transform } from "./transform.js";
-import { isDateString } from "./utils.js";
+import { isDateString, isFloat } from "./utils.js";
 
 const TS_COLUMN_NAME = "timestamp";
 const MID_COLUMN_NAME = "message_id";
@@ -29,8 +29,12 @@ enum ColumnType {
 type ClickhouseColumnDefinition =
   | { type: ColumnType.BOOLEAN; default?: boolean; nullable?: true }
   | { type: ColumnType.INTEGER; default?: number; nullable?: true }
+  | { type: ColumnType.FLOAT; default?: number; nullable?: true }
   | {
-      type: Exclude<ColumnType, ColumnType.BOOLEAN | ColumnType.INTEGER>; // String, Date, ...
+      type: Exclude<
+        ColumnType,
+        ColumnType.BOOLEAN | ColumnType.INTEGER | ColumnType.FLOAT
+      >; // String, Date, ...
       default?: string;
       nullable?: true;
     };
@@ -326,7 +330,11 @@ class ClickhouseBatchClient {
           requestedSchema[property] = { type: ColumnType.STRING };
         }
       } else if (typeof propertyValue === "number") {
-        requestedSchema[property] = { type: ColumnType.INTEGER };
+        if (isFloat(propertyValue)) {
+          requestedSchema[property] = { type: ColumnType.FLOAT };
+        } else {
+          requestedSchema[property] = { type: ColumnType.INTEGER };
+        }
       } else if (propertyValue instanceof Date) {
         requestedSchema[property] = { type: ColumnType.DATE64 };
       } else {
