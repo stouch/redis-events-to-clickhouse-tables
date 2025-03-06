@@ -13,7 +13,6 @@ declare global {
       [key: string]: string | undefined;
       USE_CLICKHOUSE_ASYNC_INSERT?: "1" | "0";
       CLICKHOUSE_ALTERED_COLUMN_NULLABLE?: "1" | "0";
-      TAKE_UP_TO_PER_BATCH: string; // Integer
       REDIS_BULL_DB: string;
       REDIS_BULL_EVENTS_QUEUNAME: string;
       DESTINATION_CLICKHOUSE_DB: string;
@@ -21,6 +20,16 @@ declare global {
       DESTINATION_CLICKHOUSE_DB_PW?: string;
       DESTINATION_CLICKHOUSE_DB_NAME: string;
       BULK_REPEAT_INTERVAL_SEC: string; // In seconds
+      // Maximum per-batch INSERT INTO in the clickhouse db:
+      TAKE_UP_TO_PER_BATCH: string; // Integer
+      // Number of events we can keep in memory of the instance that hosts
+      //  the bulker.
+      //
+      // The bigger it is, the bigger it's risky (loss of events) if the instance stops to work.
+      // It must be greater than `TAKE_UP_TO_PER_BATCH`.
+      // We wish to have it big when you want to avoid too much events in the redis queue,
+      //  in cases the processing (INSERT INTO) of events is slow.
+      BULKER_MAX_LENGTH: string;
       RE_ENQUEUE_OLD_BULL_EVENTS?: "1" | "0";
       RE_ENQUEUE_OLD_BULL_EVENTS_JOBNAME?: string;
       REDIS_JOB_EVENT_TYPE_PROPERTY:
@@ -51,6 +60,10 @@ export type EventToInjest = {
   [key in typeof process.env.REDIS_JOB_EVENT_TYPE_PROPERTY]: string;
 } & { __process_single?: true } & EventData;
 
+// ----------------------------
+// Config variables definitions
+// ----------------------------
+
 if (
   !process.env.DESTINATION_CLICKHOUSE_DB ||
   !process.env.DESTINATION_CLICKHOUSE_DB_NAME
@@ -73,13 +86,22 @@ if (!process.env.REDIS_JOB_EVENT_TYPE_PROPERTY) {
 }
 
 export const EVENT_TYPE_PROPERTY = process.env.REDIS_JOB_EVENT_TYPE_PROPERTY;
-
 export const CLICKHOUSE_NEW_COL_NULLABLE =
   process.env.CLICKHOUSE_ALTERED_COLUMN_NULLABLE === "1";
 
 const TAKE_UP_TO_PER_BATCH = +(process.env.TAKE_UP_TO_PER_BATCH || 10);
+const BULKER_MAX_LENGTH = +(process.env.BULKER_MAX_LENGTH || 10);
+if (BULKER_MAX_LENGTH < TAKE_UP_TO_PER_BATCH) {
+  throw new Error(
+    `BULKER_MAX_LENGTH cannot be lower than TAKE_UP_TO_PER_BATCH`
+  );
+}
 const BULKER_REPEAT_INTERVAL_MS =
   +(process.env.BULK_REPEAT_INTERVAL_SEC || 1) * 1000;
+
+// -----------------------------------
+// End of config variables definitions
+// -----------------------------------
 
 const queue = new Queue(
   process.env.REDIS_BULL_EVENTS_QUEUNAME,
@@ -196,12 +218,37 @@ if (cluster.isMaster) {
         bulkers[eventName] = new Bulker({
           eventName,
           takeUpToPerBatch: TAKE_UP_TO_PER_BATCH,
+          maxBulkerLength: BULKER_MAX_LENGTH,
           clickhouseClient: destinationClickhouseClient,
         });
       }
       // And we enqueue the event in the bulker for later:
-      //  We cannot throw error here, we just gonna enqueue and it will throw in the below bulker processing.
-      bulkers[eventName].enqueue(eventData);
+      // We just gonna enqueue and it will throw in case of INSERT errors in the below bulker processing.
+      try {
+        bulkers[eventName].enqueue(eventData);
+      } catch (err) {
+        // We can have a throw during the enqueue if the bulker is full,
+        //  and in that common case, we dont want to loose the event
+        //  (and dont loose it neither because of too many attempts of `job` redis),
+        //  so we just re-enqueue:
+        if (err.message === "errors.bulker_full") {
+          console.warn("Bulker is full, reenqueue...");
+          // Just re-enqueue for later, whatever the attempts value is in current `job`:
+          const bulkerFullDelayMs = 5000;
+          queue.add(
+            {
+              ...eventData,
+            },
+            {
+              delay: bulkerFullDelayMs,
+              // attempts: 1 // Dont set attempts because retry is made by accepting the event
+              //  and re-injecting it (like we are doing here)
+            }
+          );
+        } else {
+          throw err; // No supposed to have any ther possible error ..but just in case of
+        }
+      }
     }
 
     return true;

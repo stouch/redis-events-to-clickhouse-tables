@@ -1,7 +1,8 @@
 version: "3.8"
 
 services:
-  app:
+  redisjobs_to_chtables:
     build: .
+    container_name: "redisjobs_to_chtables"
     env_file: ./.env
     command: ["node", "/app/build/src/main.js"]
