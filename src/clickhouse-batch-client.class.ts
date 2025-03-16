@@ -7,6 +7,7 @@ import {
   EventDataValue,
   EventToInjest,
   isRecordOfEventData,
+  RecordOfEventDataValue,
 } from "./main.js";
 import { randomUUID } from "crypto";
 import { transform } from "./transform.js";
@@ -192,7 +193,7 @@ class ClickhouseBatchClient {
   private prepareRowColumns(
     rowColumnValues: EventToInjest
   ): Record<string, EventDataValue> {
-    const rowWithoutEvenType: Record<string, EventDataValue> = {};
+    const rowToInjestInTable: Record<string, EventDataValue> = {};
     // For each column:
     for (const eventKey in rowColumnValues) {
       // First exclude the forbidden column name:
@@ -205,28 +206,49 @@ class ClickhouseBatchClient {
       ) {
         continue;
       }
-      // And parse array or sub records:
+      // And split in several columns,
+      //  if one column contains an array of records or an array of simple values:
       if (Array.isArray(rowColumnValues[eventKey])) {
-        const rowValues: EventDataValue[] = rowColumnValues[eventKey];
-        rowValues.map((rowValue, idx) => {
-          const snakifiedKey: string = snakeCase<string>(eventKey);
-          rowWithoutEvenType[`${snakifiedKey}_${idx}`] = rowValue;
-        });
-      } else if (isRecordOfEventData(rowColumnValues[eventKey])) {
+        // For each item of the array, we gonna add a column in the row:
+        rowColumnValues[eventKey].map(
+          (
+            rowColumnArrayItem: EventDataValue | RecordOfEventDataValue,
+            idx: number
+          ) => {
+            if (isRecordOfEventData(rowColumnArrayItem)) {
+              // For each key of the record of each item of the array, we add a column in the row:
+              Object.keys(rowColumnArrayItem).map((eachRecordKey) => {
+                const snakifiedKey: string = snakeCase<string>(
+                  `${eventKey}_${idx}_${eachRecordKey}`
+                );
+                rowToInjestInTable[snakifiedKey] =
+                  rowColumnArrayItem[eachRecordKey];
+              });
+            } else {
+              const snakifiedKey: string = snakeCase<string>(eventKey);
+              rowToInjestInTable[`${snakifiedKey}_${idx}`] = rowColumnArrayItem;
+            }
+          }
+        );
+      }
+      // And split in several columns, if one column contains a record.
+      // For each key of the record, we add a column in the row:
+      else if (isRecordOfEventData(rowColumnValues[eventKey])) {
         Object.keys(rowColumnValues[eventKey]).map((eachRecordKey) => {
           const snakifiedKey: string = snakeCase<string>(
             `${eventKey}_${eachRecordKey}`
           );
-          rowWithoutEvenType[snakifiedKey] =
+          rowToInjestInTable[snakifiedKey] =
             rowColumnValues[eventKey][eachRecordKey];
         });
       } else {
         const rowValue: EventDataValue = rowColumnValues[eventKey];
         const snakifiedKey: string = snakeCase<string>(eventKey);
-        rowWithoutEvenType[snakifiedKey] = rowValue;
+        rowToInjestInTable[snakifiedKey] = rowValue;
       }
     }
-    return rowWithoutEvenType;
+    // And all the column names are snakified (above):
+    return rowToInjestInTable;
   }
 
   // Ensure we gonna use column names in snake_case, and that we aint going to persist "event_type" (${EVENT_TYPE_PROPERTY}) from the redis bull event job.

@@ -46,9 +46,10 @@ declare global {
 
 // Define type of the redis job events payload:
 export type EventDataValue = string | number | boolean | Date;
-export type ArrayOfEventData = EventDataValue[];
-export type RecordOfEventData = Record<string, EventDataValue>;
-export const isRecordOfEventData = (obj: unknown): obj is RecordOfEventData => {
+export type ArrayOfEventDataValue = EventDataValue[];
+export type RecordOfEventDataValue = Record<string, EventDataValue>;
+export type ArrayOfRecordOfEventDataValue = RecordOfEventDataValue[];
+export const isRecordOfEventData = (obj: unknown): obj is RecordOfEventDataValue => {
   if (
     typeof obj === "object" &&
     !(obj instanceof Date) &&
@@ -62,7 +63,7 @@ export const isRecordOfEventData = (obj: unknown): obj is RecordOfEventData => {
 
 export type EventData = Record<
   string,
-  EventDataValue | RecordOfEventData | ArrayOfEventData
+  EventDataValue | RecordOfEventDataValue | ArrayOfEventDataValue | ArrayOfRecordOfEventDataValue
 >;
 export type EventToInjest = {
   [key in typeof process.env.REDIS_JOB_EVENT_TYPE_PROPERTY]: string;
