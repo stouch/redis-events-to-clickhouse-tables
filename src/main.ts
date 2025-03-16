@@ -253,6 +253,7 @@ queue.on("failed", (job, _err) => {
             __is_from_old_queue: true,
           },
           {
+            removeOnComplete: true,
             // TODO: These strange events propably have a delay in seconds too,
             //  but should we keep "delay"?
             //  While our goal is to process events which are not supposed to be delayed anyway.
@@ -362,6 +363,7 @@ queue.process(async (job): Promise<boolean> => {
               : 1,
           },
           {
+            removeOnComplete: true,
             delay: bulkerFullDelayMs,
             // attempts: 1 // Dont set attempts because retry is made by accepting the event
             //  and re-injecting it (like we are doing here)
@@ -410,6 +412,7 @@ bulkerInterval = setInterval(() => {
               __is_single_retry: true, // As mentioned, it will not be process here anymore in the bulk processing (see above code in the queue.process())
             },
             {
+              removeOnComplete: true,
               delay: failDelayMs,
               backoff: {
                 // .. and make the unitary retry with an exponential backoff:
