@@ -246,7 +246,10 @@ class ClickhouseBatchClient {
     });
   }
 
-  private getClickhouseColumnsSql(columnsToAdd: ClickhouseTableSchema) {
+  private getClickhouseColumnsSql(
+    columnsToAdd: ClickhouseTableSchema,
+    isUpdateSyntax: boolean = false
+  ) {
     // Build the SQL for CREATE TABLE of colums, or ALTER TABLE columns:
     const addColumnQueries = Object.keys(columnsToAdd).map(
       (columnName: ColumnName) => {
@@ -254,7 +257,7 @@ class ClickhouseBatchClient {
         const type = column.nullable ? `Nullable(${column.type})` : column.type;
         const defaultValue = column.default;
         // ex: [..., `age` UInt64 DEFAULT 18, ...]
-        return `${columnName} ${type} ${
+        return `${columnName} ${isUpdateSyntax ? "TYPE " : ""}${type} ${
           defaultValue !== undefined
             ? typeof defaultValue === "string"
               ? `DEFAULT '${defaultValue.replace(/'/g, "\\'")}'`
@@ -392,7 +395,7 @@ class ClickhouseBatchClient {
         await this.clickhouseClient.query({
           query: `DESCRIBE ${tableName}`,
         })
-      ).json<{ name: string; type: ColumnType; default_expression: string }>()
+      ).json<{ name: string; type: string; default_expression: string }>()
     ).data;
 
     /*
@@ -411,7 +414,11 @@ class ClickhouseBatchClient {
     */
     const mappedSchema: ClickhouseTableSchema = {};
     for (const column of currentSchema) {
-      mappedSchema[column.name] = { type: column.type };
+      const columnType = column.type;
+      mappedSchema[column.name] = {
+        type: columnType.replace(/Nullable\((.*)\)/gm, "$1") as ColumnType,
+        nullable: columnType.indexOf("Nullable(") > -1 || undefined,
+      };
     }
     return mappedSchema;
   }
@@ -432,10 +439,27 @@ class ClickhouseBatchClient {
     requestedSchema: ClickhouseTableSchema;
   }): Promise<ClickhouseTableSchema> {
     const missingColumns: Record<ColumnName, ClickhouseColumnDefinition> = {};
+    const modifiedColumns: Record<ColumnName, ClickhouseColumnDefinition> = {};
     for (const requestedColumn in requestedSchema) {
       if (currentSchema[requestedColumn]) {
         // Column exists!
-        // We 'd suppsoed to check the value of the column type ?
+        if (
+          currentSchema[requestedColumn].type === ColumnType.INTEGER ||
+          currentSchema[requestedColumn].type === ColumnType.BOOLEAN ||
+          currentSchema[requestedColumn].type === ColumnType.FLOAT
+        ) {
+          // This is a specific case of when we want to inject STRING in existing columns
+          //  of integer/boolean/float and this might not going to do any trouble.
+          // So in this specific case we ALTER the column:
+          if (requestedSchema[requestedColumn].type === ColumnType.STRING) {
+            modifiedColumns[requestedColumn] = {
+              ...requestedSchema[requestedColumn],
+              nullable: currentSchema[requestedColumn].nullable
+                ? true
+                : undefined,
+            };
+          }
+        }
         continue;
       } else {
         // Table exists, we gonna make the columns not required:
@@ -448,6 +472,18 @@ class ClickhouseBatchClient {
     if (Object.keys(missingColumns).length > 0) {
       const addQueries = this.getClickhouseColumnsSql(missingColumns);
       const sqlQuery = `ALTER TABLE \`${tableName}\` ADD COLUMN ${addQueries.join(", ADD COLUMN ")};`;
+      console.debug({ sqlQuery });
+      try {
+        await this.clickhouseClient.query({
+          query: sqlQuery,
+        });
+      } catch (err) {
+        throw err;
+      }
+    }
+    if (Object.keys(modifiedColumns).length > 0) {
+      const updateQueries = this.getClickhouseColumnsSql(modifiedColumns, true);
+      const sqlQuery = `ALTER TABLE \`${tableName}\` ALTER COLUMN ${updateQueries.join(", ALTER COLUMN ")};`;
       console.debug({ sqlQuery });
       try {
         await this.clickhouseClient.query({
