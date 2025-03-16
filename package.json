@@ -22,7 +22,6 @@
     "@types/bull": "^4.10.4",
     "@types/redis": "^4.0.11",
     "bull": "^4.16.5",
-    "cluster": "^0.7.7",
     "dayjs": "^1.11.13",
     "dotenv": "^16.4.7",
     "lodash.snakecase": "^4.1.1",
