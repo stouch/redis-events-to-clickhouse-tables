@@ -8,6 +8,8 @@ import {
   EventToInjest,
   isRecordOfEventData,
   RecordOfEventDataValue,
+  SPLIT_ARRAY_ITEMS_AS_COLUMNS,
+  SPLIT_RECORDS_AS_COLUMNS,
 } from "./main.js";
 import { randomUUID } from "crypto";
 import { transform } from "./transform.js";
@@ -209,38 +211,61 @@ class ClickhouseBatchClient {
       // And split in several columns,
       //  if one column contains an array of records or an array of simple values:
       if (Array.isArray(rowColumnValues[eventKey])) {
-        // For each item of the array, we gonna add a column in the row:
-        rowColumnValues[eventKey].map(
-          (
-            rowColumnArrayItem: EventDataValue | RecordOfEventDataValue,
-            idx: number
-          ) => {
-            if (isRecordOfEventData(rowColumnArrayItem)) {
-              // For each key of the record of each item of the array, we add a column in the row:
-              Object.keys(rowColumnArrayItem).map((eachRecordKey) => {
-                const snakifiedKey: string = snakeCase<string>(
-                  `${eventKey}_${idx}_${eachRecordKey}`
-                );
-                rowToInjestInTable[snakifiedKey] =
-                  rowColumnArrayItem[eachRecordKey];
-              });
-            } else {
-              const snakifiedKey: string = snakeCase<string>(eventKey);
-              rowToInjestInTable[`${snakifiedKey}_${idx}`] = rowColumnArrayItem;
+        if (SPLIT_ARRAY_ITEMS_AS_COLUMNS) {
+          // For each item of the array, we gonna add a column in the row:
+          rowColumnValues[eventKey].map(
+            (
+              rowColumnArrayItem: EventDataValue | RecordOfEventDataValue,
+              idx: number
+            ) => {
+              if (isRecordOfEventData(rowColumnArrayItem)) {
+                if (SPLIT_RECORDS_AS_COLUMNS) {
+                  // For each key of the record of each item of the array, we add a column in the row:
+                  Object.keys(rowColumnArrayItem).map((eachRecordKey) => {
+                    const snakifiedKey: string = snakeCase<string>(
+                      `${eventKey}_${idx}_${eachRecordKey}`
+                    );
+                    rowToInjestInTable[snakifiedKey] =
+                      rowColumnArrayItem[eachRecordKey];
+                  });
+                } else {
+                  const snakifiedKey: string = snakeCase<string>(
+                    `${eventKey}_${idx}`
+                  );
+                  rowToInjestInTable[snakifiedKey] =
+                    JSON.stringify(rowColumnArrayItem);
+                }
+              } else {
+                const snakifiedKey: string = snakeCase<string>(eventKey);
+                rowToInjestInTable[`${snakifiedKey}_${idx}`] =
+                  rowColumnArrayItem;
+              }
             }
-          }
-        );
+          );
+        } else {
+          const snakifiedKey: string = snakeCase<string>(eventKey);
+          rowToInjestInTable[`${snakifiedKey}`] = JSON.stringify(
+            rowColumnValues[eventKey]
+          );
+        }
       }
       // And split in several columns, if one column contains a record.
       // For each key of the record, we add a column in the row:
       else if (isRecordOfEventData(rowColumnValues[eventKey])) {
-        Object.keys(rowColumnValues[eventKey]).map((eachRecordKey) => {
-          const snakifiedKey: string = snakeCase<string>(
-            `${eventKey}_${eachRecordKey}`
+        if (SPLIT_RECORDS_AS_COLUMNS) {
+          Object.keys(rowColumnValues[eventKey]).map((eachRecordKey) => {
+            const snakifiedKey: string = snakeCase<string>(
+              `${eventKey}_${eachRecordKey}`
+            );
+            rowToInjestInTable[snakifiedKey] =
+              rowColumnValues[eventKey][eachRecordKey];
+          });
+        } else {
+          const snakifiedKey: string = snakeCase<string>(eventKey);
+          rowToInjestInTable[`${snakifiedKey}`] = JSON.stringify(
+            rowColumnValues[eventKey]
           );
-          rowToInjestInTable[snakifiedKey] =
-            rowColumnValues[eventKey][eachRecordKey];
-        });
+        }
       } else {
         const rowValue: EventDataValue = rowColumnValues[eventKey];
         const snakifiedKey: string = snakeCase<string>(eventKey);

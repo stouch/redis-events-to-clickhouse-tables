@@ -16,6 +16,8 @@ declare global {
       DEBUG_STORE_LOG_PATH?: string;
       USE_CLICKHOUSE_ASYNC_INSERT?: "1" | "0";
       CLICKHOUSE_ALTERED_COLUMN_NULLABLE?: "1" | "0";
+      SPLIT_RECORDS_AS_COLUMNS?: "1" | "0";
+      SPLIT_ARRAY_ITEMS_AS_COLUMNS?: "1" | "0";
       REDIS_BULL_DB: string;
       REDIS_BULL_EVENTS_QUEUNAME: string;
       DESTINATION_CLICKHOUSE_DB: string;
@@ -49,7 +51,9 @@ export type EventDataValue = string | number | boolean | Date;
 export type ArrayOfEventDataValue = EventDataValue[];
 export type RecordOfEventDataValue = Record<string, EventDataValue>;
 export type ArrayOfRecordOfEventDataValue = RecordOfEventDataValue[];
-export const isRecordOfEventData = (obj: unknown): obj is RecordOfEventDataValue => {
+export const isRecordOfEventData = (
+  obj: unknown
+): obj is RecordOfEventDataValue => {
   if (
     typeof obj === "object" &&
     !(obj instanceof Date) &&
@@ -63,7 +67,10 @@ export const isRecordOfEventData = (obj: unknown): obj is RecordOfEventDataValue
 
 export type EventData = Record<
   string,
-  EventDataValue | RecordOfEventDataValue | ArrayOfEventDataValue | ArrayOfRecordOfEventDataValue
+  | EventDataValue
+  | RecordOfEventDataValue
+  | ArrayOfEventDataValue
+  | ArrayOfRecordOfEventDataValue
 >;
 export type EventToInjest = {
   [key in typeof process.env.REDIS_JOB_EVENT_TYPE_PROPERTY]: string;
@@ -106,6 +113,10 @@ export const DEBUG_STORE_LOG_PATH =
 export const EVENT_TYPE_PROPERTY = process.env.REDIS_JOB_EVENT_TYPE_PROPERTY;
 export const CLICKHOUSE_NEW_COL_NULLABLE =
   process.env.CLICKHOUSE_ALTERED_COLUMN_NULLABLE === "1";
+export const SPLIT_RECORDS_AS_COLUMNS =
+  process.env.SPLIT_RECORDS_AS_COLUMNS === "1";
+export const SPLIT_ARRAY_ITEMS_AS_COLUMNS =
+  process.env.SPLIT_ARRAY_ITEMS_AS_COLUMNS === "1";
 
 const TAKE_UP_TO_PER_BATCH = +(process.env.TAKE_UP_TO_PER_BATCH || 10);
 const BULKER_MAX_LENGTH = +(process.env.BULKER_MAX_LENGTH || 10);
