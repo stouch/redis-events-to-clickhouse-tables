@@ -127,7 +127,7 @@ class Bulker {
         `#${this.destinationClickhouseTable}, Still has ${this.currentBatchToProcess.length} events that were waiting. Re-enqueue them:`
       );
       for (const eventData of this.currentBatchToProcess) {
-        queue.add({ ...eventData });
+        queue.add({ ...eventData }, { removeOnComplete: true });
       }
     }
     console.log(`#${this.destinationClickhouseTable}: Done.`);
