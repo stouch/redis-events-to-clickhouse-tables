@@ -175,7 +175,7 @@ class ClickhouseBatchClient {
   // --------------------
 
   /*
-   * Prepare a 1-dimension row from an event:
+   * Prepare a 1-dimension row (with snakified column names) from an event:
    * eg:
    *  {
    *     "event_type": "<clickhouse table name>",
@@ -279,7 +279,7 @@ class ClickhouseBatchClient {
   // Ensure we gonna use column names in snake_case, and that we aint going to persist "event_type" (${EVENT_TYPE_PROPERTY}) from the redis bull event job.
   private prepareRows(rows: EventToInjest[]): Record<string, EventDataValue>[] {
     return rows.map((row) => {
-      const rowWithPrimaryKey = {
+      const rowWithPrimaryKey: Record<string, EventDataValue> = {
         ...this.prepareRowColumns(row),
         [`${RECEIVED_AT_TS_COLUMN_NAME}`]:
           typeof row.__received_at === "string"
@@ -289,7 +289,7 @@ class ClickhouseBatchClient {
         [`${MID_COLUMN_NAME}`]: `${randomUUID()}`,
       };
       // Apply the custom-transform (if it's defined):
-      return transform(rowWithPrimaryKey);
+      return transform(rowWithPrimaryKey, row);
     });
   }
 

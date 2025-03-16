@@ -2,7 +2,8 @@
 export const transform = <
   T extends Record<string, string | number | Date | boolean>,
 >(
-  jobData: T
+  jobData: T,
+  _initialJobData: Record<string, unknown>
 ): T => {
   //
   // Write your code here
