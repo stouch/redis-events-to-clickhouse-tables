@@ -12,7 +12,8 @@ import { randomUUID } from "crypto";
 import { transform } from "./transform.js";
 import { isDateString, isFloat } from "./utils.js";
 
-const TS_COLUMN_NAME = "timestamp";
+const RECEIVED_AT_TS_COLUMN_NAME = "received_at";
+const SENT_AT_TS_COLUMN_NAME = "sent_at";
 const MID_COLUMN_NAME = "message_id";
 
 export type EventToInjestInTable = Record<string, EventDataValue>;
@@ -99,7 +100,6 @@ class ClickhouseBatchClient {
     const tableExists = await this.doesTableExist(tableName);
     if (tableExists) {
       const existingSchema = await this.getClickhouseTableSchema(tableName);
-
       this.preparedSchema = {
         table: tableName,
         schema: await this.addMissingColumns({
@@ -176,7 +176,7 @@ class ClickhouseBatchClient {
    * eg:
    *  {
    *     "event_type": "<clickhouse table name>",
-   *     "__process_single": true,
+   *     "__is_single_retry": true,
    *     "someTest": "value",
    *     "someKey": ["withArray", "value"],
    *     "correct_case": {"subRecord": "withValue"}
@@ -196,7 +196,13 @@ class ClickhouseBatchClient {
     // For each column:
     for (const eventKey in rowColumnValues) {
       // First exclude the forbidden column name:
-      if (eventKey === EVENT_TYPE_PROPERTY || eventKey === "__process_single") {
+      if (
+        eventKey === EVENT_TYPE_PROPERTY ||
+        eventKey === "__is_single_retry" ||
+        eventKey === "__is_from_old_queue" ||
+        eventKey === "__bulker_full_attempts" ||
+        eventKey === "__received_at"
+      ) {
         continue;
       }
       // And parse array or sub records:
@@ -228,7 +234,11 @@ class ClickhouseBatchClient {
     return rows.map((row) => {
       const rowWithPrimaryKey = {
         ...this.prepareRowColumns(row),
-        [`${TS_COLUMN_NAME}`]: dayjs().toDate(),
+        [`${RECEIVED_AT_TS_COLUMN_NAME}`]:
+          typeof row.__received_at === "string"
+            ? dayjs(row.__received_at).toDate()
+            : row.__received_at,
+        [`${SENT_AT_TS_COLUMN_NAME}`]: dayjs().toDate(),
         [`${MID_COLUMN_NAME}`]: `${randomUUID()}`,
       };
       // Apply the custom-transform (if it's defined):
@@ -307,7 +317,6 @@ class ClickhouseBatchClient {
 
   // Get the columns of a set of rows.
   // We need to crawl all the rows to find all the columns because some of rows might not have all the columns set.
-  // And we prefix the minimum column list with the two required columns (timestamp, message_id,...)
   private getColsMinimumList(rows: EventToInjestInTable[]) {
     return [
       // Deduplicated columns from all the rows
@@ -476,7 +485,7 @@ class ClickhouseBatchClient {
           `)} 
          ) 
          ENGINE = MergeTree() 
-         ORDER BY ${TS_COLUMN_NAME};`;
+         ORDER BY ${SENT_AT_TS_COLUMN_NAME};`;
       console.debug({ sqlQuery });
       await this.clickhouseClient.query({
         query: sqlQuery,

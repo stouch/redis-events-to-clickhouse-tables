@@ -3,7 +3,9 @@ import cluster from "cluster";
 import Bulker from "./bulker.class.js";
 import { createClient } from "@clickhouse/client";
 import ClickhouseBatchClient from "./clickhouse-batch-client.class.js";
+import * as fs from "fs";
 import dotenv from "dotenv";
+import { dayjs } from "./dayjs-utc.js";
 dotenv.config();
 
 // Define process.env.REDIS_JOB_EVENT_TYPE_PROPERTY type:
@@ -11,6 +13,8 @@ declare global {
   namespace NodeJS {
     interface ProcessEnv {
       [key: string]: string | undefined;
+      DEBUG_STORE_LOG?: "1" | "0";
+      DEBUG_STORE_LOG_PATH?: string;
       USE_CLICKHOUSE_ASYNC_INSERT?: "1" | "0";
       CLICKHOUSE_ALTERED_COLUMN_NULLABLE?: "1" | "0";
       REDIS_BULL_DB: string;
@@ -46,7 +50,12 @@ export type EventDataValue = string | number | boolean | Date;
 export type ArrayOfEventData = EventDataValue[];
 export type RecordOfEventData = Record<string, EventDataValue>;
 export const isRecordOfEventData = (obj: unknown): obj is RecordOfEventData => {
-  if (typeof obj === "object" && !(obj instanceof Date)) {
+  if (
+    typeof obj === "object" &&
+    !(obj instanceof Date) &&
+    obj !== null &&
+    obj !== undefined
+  ) {
     return true;
   }
   return false;
@@ -58,7 +67,12 @@ export type EventData = Record<
 >;
 export type EventToInjest = {
   [key in typeof process.env.REDIS_JOB_EVENT_TYPE_PROPERTY]: string;
-} & { __process_single?: true } & EventData;
+} & {
+  __is_single_retry?: true;
+  __is_from_old_queue?: true; // In case it's an event that was initially in `RE_ENQUEUE_OLD_BULL_EVENTS_JOBNAME`
+  __bulker_full_attempts?: number; // Store this in the event for how many times we tried the event but bulker was full so we re-enqueued it.
+  __received_at?: Date | string;
+} & EventData;
 
 // ----------------------------
 // Config variables definitions
@@ -84,6 +98,10 @@ if (!process.env.BULK_REPEAT_INTERVAL_SEC) {
 if (!process.env.REDIS_JOB_EVENT_TYPE_PROPERTY) {
   throw new Error("MISSING ENV VAR: `REDIS_JOB_EVENT_TYPE_PROPERTY`");
 }
+
+export const DEBUG_STORE_LOG = process.env.DEBUG_STORE_LOG === "1";
+export const DEBUG_STORE_LOG_PATH =
+  process.env.DEBUG_STORE_LOG_PATH || "/tmp/debug.log";
 
 export const EVENT_TYPE_PROPERTY = process.env.REDIS_JOB_EVENT_TYPE_PROPERTY;
 export const CLICKHOUSE_NEW_COL_NULLABLE =
@@ -124,6 +142,56 @@ const destinationClickhouseClient = createClient({
 const emergencyBatchClient = new ClickhouseBatchClient(
   destinationClickhouseClient
 );
+
+const trace = ({
+  pre,
+  obj,
+  outputSuffix,
+  full,
+}: {
+  pre?: string;
+  obj: Record<string, any> | Record<string, any>[];
+  outputSuffix?: string;
+  full?: boolean;
+}) => {
+  if (DEBUG_STORE_LOG) {
+    fs.appendFile(
+      DEBUG_STORE_LOG_PATH + (outputSuffix || ""),
+      `${pre ? pre : ""}` +
+        JSON.stringify(
+          full
+            ? obj
+            : Array.isArray(obj)
+              ? obj.map((row) => ({
+                  type: row[EVENT_TYPE_PROPERTY],
+                  received_at: (row as any).__received_at,
+                  from_old_queue: (row as any).__is_from_old_queue
+                    ? true
+                    : undefined,
+                  // Nb attempts when bulker was full:
+                  bulker_full_attempts: (row as any).__bulker_full_attempts
+                    ? (row as any).__bulker_full_attempts
+                    : undefined,
+                }))
+              : {
+                  type: obj[EVENT_TYPE_PROPERTY],
+                  received_at: (obj as any).__received_at,
+                  from_old_queue: (obj as any).__is_from_old_queue
+                    ? true
+                    : undefined,
+                  // Nb attempts when bulker was full:
+                  bulker_full_attempts: (obj as any).__bulker_full_attempts
+                    ? (obj as any).__bulker_full_attempts
+                    : undefined,
+                }
+        ) +
+        "\n",
+      (_err) => {}
+    );
+  }
+};
+
+let bulkerInterval: NodeJS.Timeout = undefined;
 
 // We gonna deploy with one worker only.
 const numWorkers = 1;
@@ -168,13 +236,30 @@ if (cluster.isMaster) {
         // And these jobs have this strange timestamp in seconds: (While ms has timestamp str length >= 13)
         if (job.timestamp && `${job.timestamp}`.length <= 10) {
           const dataToReenqueue = job.data;
-          queue.add(dataToReenqueue, {
-            // TODO: These strange events propably have a delay in seconds too,
-            //  but should we keep "delay"?
-            //  While our goal is to process events which are not supposed to be delayed anyway.
-            // delay: (job as any).delay ? (job as any).delay * 1000  : undefined
-            // For now, we just re-enqueue them.
+
+          if (!dataToReenqueue.__received_at) {
+            // First time we process this failed event from `main` queue, let's flag its date:
+            dataToReenqueue.__received_at = dayjs().toDate();
+          }
+
+          trace({
+            pre: "re-enqueue:",
+            obj: dataToReenqueue,
+            outputSuffix: ".reenqueue.log",
           });
+          queue.add(
+            {
+              ...dataToReenqueue,
+              __is_from_old_queue: true,
+            },
+            {
+              // TODO: These strange events propably have a delay in seconds too,
+              //  but should we keep "delay"?
+              //  While our goal is to process events which are not supposed to be delayed anyway.
+              // delay: (job as any).delay ? (job as any).delay * 1000  : undefined
+              // For now, we just re-enqueue them.
+            }
+          );
 
           // And request to remove this strange old job:
           job.remove();
@@ -196,19 +281,41 @@ if (cluster.isMaster) {
       return true;
     }
 
-    if (eventData.__process_single === true) {
+    if (!eventData.__received_at) {
+      // First time we process this event, let's flag it:
+      //  this `eventData` (with __received_at) will be kept whatever if we re-enqueue it or not:
+      eventData.__received_at = dayjs().toDate();
+    }
+
+    if (eventData.__is_single_retry === true) {
       console.debug(
-        `Single failed event to process... Attempt made: ${job.attemptsMade}. ID: ${job.id}`
+        `Single failed event to process again... Attempt made: ${job.attemptsMade}. ID: ${job.id}`
       );
       try {
         // This case is when an event has failed in the bulker,
         // This unitary try can throw (see the below code of bulk processing):
+        trace({
+          pre: "process/failed-single:",
+          obj: eventData,
+          outputSuffix: ".failedsingle.process.log",
+        });
         await emergencyBatchClient.prepareSchemaAndInjest({
           tableName: eventName,
           rows: [eventData],
         });
+        trace({
+          pre: "success:",
+          obj: [eventData],
+          outputSuffix: ".success.log",
+        });
         console.debug(`Single event success. ID: ${job.id}`);
       } catch (err) {
+        trace({
+          pre: "process/failed-single/error:",
+          obj: eventData,
+          full: true,
+          outputSuffix: ".failedsingle.error.log",
+        });
         console.error(err);
         throw err; // Throw error, and the job.backoff strategy is applied (see the below code of bulk processing).
       }
@@ -225,6 +332,11 @@ if (cluster.isMaster) {
       // And we enqueue the event in the bulker for later:
       // We just gonna enqueue and it will throw in case of INSERT errors in the below bulker processing.
       try {
+        trace({
+          pre: "enqueue/inbulk:",
+          obj: eventData,
+          outputSuffix: ".bulkenqueue.log",
+        });
         bulkers[eventName].enqueue(eventData);
       } catch (err) {
         // We can have a throw during the enqueue if the bulker is full,
@@ -232,12 +344,22 @@ if (cluster.isMaster) {
         //  (and dont loose it neither because of too many attempts of `job` redis),
         //  so we just re-enqueue:
         if (err.message === "errors.bulker_full") {
-          console.warn("Bulker is full, reenqueue...");
+          console.warn(
+            `Bulker is full, reenqueue event of ${eventData[EVENT_TYPE_PROPERTY]}:${eventData.__received_at} (${eventData.__bulker_full_attempts || 0})...`
+          );
           // Just re-enqueue for later, whatever the attempts value is in current `job`:
           const bulkerFullDelayMs = 5000;
+          trace({
+            pre: "enqueue/forlater:",
+            obj: eventData,
+            outputSuffix: ".fullretrylater.log",
+          });
           queue.add(
             {
               ...eventData,
+              __bulker_full_attempts: eventData.__bulker_full_attempts
+                ? eventData.__bulker_full_attempts + 1
+                : 1,
             },
             {
               delay: bulkerFullDelayMs,
@@ -259,33 +381,68 @@ if (cluster.isMaster) {
   // Bulker processing (forever Interval repeating)
   // ------------------------------------------------
   // ------------------------------------------------
-  setInterval(() => {
+  bulkerInterval = setInterval(() => {
     // For each bulker (meaning each `eventName`):
     for (const eventName in bulkers) {
       // We request for a batch to be process:
-      bulkers[eventName].processBatch((failedEvents) => {
-        // Here is the way we process the failed events:
-        //  These are gonna be spread in the future, using an unitary processing, because it's too hard to split sub-batches of them:
-        const failDelayMs = 2 * 1000;
-        for (const failedEvent of failedEvents) {
-          queue.add(
-            {
-              ...failedEvent,
-              [EVENT_TYPE_PROPERTY]: eventName, // <-- already in `failedEvent`, but let's set it again to be clear.
-              __process_single: true, // As mentioned, it will not be process here anymore in the bulk processing (see above code in the queue.process())
-            },
-            {
-              delay: failDelayMs,
-              backoff: {
-                // .. and make the unitary retry with an exponential backoff:
-                type: "exponential",
-                delay: 3 * 1000,
+      bulkers[eventName].processBatch({
+        onSuccess: (successedEvents) => {
+          trace({
+            pre: "success:",
+            obj: successedEvents,
+            outputSuffix: ".success.log",
+          });
+        },
+        onFailed: (failedEvents) => {
+          // Here is the way we process the failed events:
+          //  These are gonna be spread in the future, using an unitary processing, because it's too hard to split sub-batches of them:
+          const failDelayMs = 2 * 1000;
+          for (const failedEvent of failedEvents) {
+            trace({
+              pre: "enqueue/failed:",
+              obj: failedEvent,
+              outputSuffix: ".bulkjobfailed.log",
+            });
+            queue.add(
+              {
+                ...failedEvent,
+                [EVENT_TYPE_PROPERTY]: eventName, // <-- already in `failedEvent`, but let's set it again to be clear.
+                __is_single_retry: true, // As mentioned, it will not be process here anymore in the bulk processing (see above code in the queue.process())
               },
-              attempts: 5, // And try few times at least.
-            }
-          );
-        }
+              {
+                delay: failDelayMs,
+                backoff: {
+                  // .. and make the unitary retry with an exponential backoff:
+                  type: "exponential",
+                  delay: 3 * 1000,
+                },
+                attempts: 5, // And try few times at least.
+              }
+            );
+          }
+        },
       });
     }
   }, BULKER_REPEAT_INTERVAL_MS);
+
+  // Ensure we stop the interval on exit
+  // Could trace/log something else here..
+  const onExit = () => {
+    bulkerInterval && clearInterval(bulkerInterval);
+    bulkerInterval = null;
+  };
+  process.on("exit", (_code) => {
+    console.log("exit " + process.pid);
+    onExit();
+  });
+  process.on("SIGTERM", (_signal) => {
+    console.log("SIGTERM " + process.pid);
+    onExit();
+    process.exit(0);
+  });
+  process.on("SIGINT", (_signal) => {
+    console.log("SIGINT " + process.pid);
+    onExit();
+    process.exit(0);
+  });
 }

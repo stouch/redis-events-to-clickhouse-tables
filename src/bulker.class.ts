@@ -51,7 +51,13 @@ class Bulker {
 
   private batchProcessingMetadata: BatchProcessingMetadata | null = null;
   private batchProcessing: EventToInjest[] = [];
-  async processBatch(onFailed: (failedEvents: EventToInjest[]) => void) {
+  async processBatch({
+    onFailed,
+    onSuccess,
+  }: {
+    onFailed: (failedEvents: EventToInjest[]) => void;
+    onSuccess: (successedEvents: EventToInjest[]) => void;
+  }) {
     if (this.batchProcessing.length > 0) {
       console.warn(
         `Already processing ${this.batchProcessing.length} events !`
@@ -64,7 +70,7 @@ class Bulker {
     }
 
     console.log(
-      `Gonna batch ${Math.min(this.takeUpToPerBatch, this.currentBatchToProcess.length)}/${this.currentBatchToProcess.length}`
+      `Event Queue: ${this.destinationClickhouseTable}, Gonna batch ${Math.min(this.takeUpToPerBatch, this.currentBatchToProcess.length)}/${this.currentBatchToProcess.length}`
     );
     // `splice` remove events from `this.currentBatchToProcess`
     this.batchProcessing = this.currentBatchToProcess.splice(
@@ -85,6 +91,7 @@ class Bulker {
 
       this.batchProcessingMetadata.status = "inserting";
       await this.clickhouseBatchClient.insertRows();
+      onSuccess(this.batchProcessing);
     } catch (err) {
       console.error(err);
       // If an error occur, we dont throw and loose everything, we just gonna reinject the rows we tried to injest:
