@@ -193,6 +193,8 @@ const trace = ({
 
 let bulkerInterval: NodeJS.Timeout = undefined;
 
+let onExit = async () => {};
+
 // We gonna deploy with one worker only.
 const numWorkers = 1;
 if (cluster.isMaster) {
@@ -425,24 +427,59 @@ if (cluster.isMaster) {
     }
   }, BULKER_REPEAT_INTERVAL_MS);
 
-  // Ensure we stop the interval on exit
-  // Could trace/log something else here..
-  const onExit = () => {
+  // -----------------------------------------------------------------------------------
+  // --- Gracefully stop a bulker and re-enqueue the events that were waiting in it ----
+  // -----------------------------------------------------------------------------------
+  onExit = async () => {
+    console.log("Stop the repeated bulk INSERT.");
     bulkerInterval && clearInterval(bulkerInterval);
     bulkerInterval = null;
+
+    console.log("Close the queue (stop to .process() any redis job!)");
+    queue.close();
+
+    console.log(
+      "Open a queue just to reinject if there are some waiting events in `currentBatchToProcess`..."
+    );
+    const waitingEventsQueue = new Queue(
+      process.env.REDIS_BULL_EVENTS_QUEUNAME,
+      process.env.REDIS_BULL_DB
+    );
+    await new Promise((resolve) => {
+      waitingEventsQueue.client.on("ready", () => {
+        console.log("Ready");
+        resolve(true);
+      });
+    });
+    for (const eventName in bulkers) {
+      console.log(`Re-inject bulker waiting events for ${eventName} queue...`);
+      await bulkers[eventName].finishLastBatchAndReenqueueWaitingEvents(
+        waitingEventsQueue
+      );
+    }
+    console.log("We can exit !");
   };
-  process.on("exit", (_code) => {
-    console.log("exit " + process.pid);
-    onExit();
-  });
-  process.on("SIGTERM", (_signal) => {
-    console.log("SIGTERM " + process.pid);
-    onExit();
-    process.exit(0);
-  });
-  process.on("SIGINT", (_signal) => {
-    console.log("SIGINT " + process.pid);
-    onExit();
-    process.exit(0);
-  });
 }
+
+const gracefulShutdown = async () => {
+  if (cluster.isMaster) {
+    console.log("Shutting down MASTER gracefully...");
+    setInterval(async () => {
+      const nbWorkers = Object.values(cluster.workers).length;
+      if (nbWorkers === 0) {
+        console.log("All workers have been killed. Kill the master!");
+        onExit && (await onExit());
+        process.exit(1);
+      } else {
+        console.log(`${nbWorkers} workers are still being killed...`);
+      }
+    }, 2000);
+  } else {
+    console.log(`Shutting down Worker ${cluster.worker.id} gracefully...`);
+    onExit && (await onExit());
+    process.exit(0);
+  }
+};
+
+process.on("SIGTERM", gracefulShutdown);
+process.on("SIGINT", gracefulShutdown);

@@ -2,6 +2,7 @@ import { ClickHouseClient } from "@clickhouse/client";
 import ClickhouseBatchClient from "./clickhouse-batch-client.class.js";
 import { configDotenv } from "dotenv";
 import { EventToInjest } from "./main.js";
+import { Queue } from "bull";
 
 if (!process.env || Object.keys(process.env).length === 0) {
   configDotenv();
@@ -51,6 +52,7 @@ class Bulker {
 
   private batchProcessingMetadata: BatchProcessingMetadata | null = null;
   private batchProcessing: EventToInjest[] = [];
+
   async processBatch({
     onFailed,
     onSuccess,
@@ -100,6 +102,35 @@ class Bulker {
       this.batchProcessing = [];
       this.batchProcessingMetadata = null;
     }
+  }
+
+  async finishLastBatchAndReenqueueWaitingEvents(queue: Queue) {
+    console.log(
+      `#${this.destinationClickhouseTable}: Wait for finishing the last batch..`
+    );
+    await new Promise((resolve) => {
+      setInterval(() => {
+        if (this.batchProcessingMetadata !== null) {
+          console.log(
+            `#${this.destinationClickhouseTable}: Still processing a batch...`
+          );
+        } else {
+          console.log(
+            `#${this.destinationClickhouseTable}: OK current batch processing is done.`
+          );
+          resolve(true);
+        }
+      }, 1000);
+    });
+    if (this.currentBatchToProcess.length > 0) {
+      console.log(
+        `#${this.destinationClickhouseTable}, Still has ${this.currentBatchToProcess.length} events that were waiting. Re-enqueue them:`
+      );
+      for (const eventData of this.currentBatchToProcess) {
+        queue.add({ ...eventData });
+      }
+    }
+    console.log(`#${this.destinationClickhouseTable}: Done.`);
   }
 }
 
