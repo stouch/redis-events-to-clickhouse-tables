@@ -5,5 +5,5 @@ services:
     build: .
     container_name: "redisjobs_to_chtables"
     env_file: ./.env
-    stop_grace_period: 3m
+    stop_grace_period: 3m # See README.md. Equivalent to `docker stop -t 180`
     command: ["node", "/app/build/src/main.js"]

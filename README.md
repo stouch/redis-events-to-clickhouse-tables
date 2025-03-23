@@ -62,7 +62,7 @@ In case you want to apply some transformation to your events, override the `src/
 Check the _environment_ variables in `docker-compose.yml`, and just run:
 
 ```bash
-docker compose up -d
+docker compose up --force-recreate --build -d
 ```
 
 In case you want to kill the container, use a high timeout :

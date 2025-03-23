@@ -457,7 +457,7 @@ recreateInterval = setInterval(async () => {
     .subtract(SOMETHING_IS_WRONG_DELAY_SEC, "second")
     .unix();
   const now = dayjs().unix();
-  if (now > lastQueueCreatedAt + 10) {
+  if (now > lastQueueCreatedAt + SOMETHING_IS_WRONG_DELAY_SEC) {
     if (
       (lastReadRedisEventAt === null && lastQueueCreatedAt < someLongTimeAgo) ||
       lastReadRedisEventAt < someLongTimeAgo
@@ -511,11 +511,14 @@ recreateInterval = setInterval(async () => {
       //
       // And recreate/reset the listening of the new queue
       //  using the global variable:
+      //
+      // If this re-connect throws an error,
+      //  as we ensured above to reinject the events in Redis, we will just have to restart thanks to the docker-compose
       eventsQueue = null;
       eventsQueue = new Queue(
         process.env.REDIS_BULL_EVENTS_QUEUNAME,
         process.env.REDIS_BULL_DB
-      );
+      ); 
       lastQueueCreatedAt = dayjs().unix();
       listenQueue({ queue: eventsQueue });
 
