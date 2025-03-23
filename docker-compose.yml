@@ -5,4 +5,5 @@ services:
     build: .
     container_name: "redisjobs_to_chtables"
     env_file: ./.env
+    stop_grace_period: 3m
     command: ["node", "/app/build/src/main.js"]
