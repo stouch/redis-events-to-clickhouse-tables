@@ -1,7 +1,7 @@
 import { ClickHouseClient } from "@clickhouse/client";
 import ClickhouseBatchClient from "./clickhouse-batch-client.class.js";
 import { configDotenv } from "dotenv";
-import { EventToInjest } from "./main.js";
+import { EventToInjest, warn, log, error } from "./main.js";
 import { Queue } from "bull";
 
 if (!process.env || Object.keys(process.env).length === 0) {
@@ -50,6 +50,14 @@ class Bulker {
     this.currentBatchToProcess.push(eventToInjest);
   }
 
+  getBulkWaitingQueueLength() {
+    return this.currentBatchToProcess.length;
+  }
+
+  getBulkingQueueLength() {
+    return this.batchProcessing.length;
+  }
+
   private batchProcessingMetadata: BatchProcessingMetadata | null = null;
   private batchProcessing: EventToInjest[] = [];
 
@@ -61,8 +69,8 @@ class Bulker {
     onSuccess: (successedEvents: EventToInjest[]) => void;
   }) {
     if (this.batchProcessing.length > 0) {
-      console.warn(
-        `Already processing ${this.batchProcessing.length} events !`
+      warn(
+        `Waiting for ${this.batchProcessing.length} events to be processed..`
       );
       return;
     }
@@ -71,7 +79,7 @@ class Bulker {
       return;
     }
 
-    console.log(
+    log(
       `Event Queue: ${this.destinationClickhouseTable}, Gonna batch ${Math.min(this.takeUpToPerBatch, this.currentBatchToProcess.length)}/${this.currentBatchToProcess.length}`
     );
     // `splice` remove events from `this.currentBatchToProcess`
@@ -95,7 +103,7 @@ class Bulker {
       await this.clickhouseBatchClient.insertRows();
       onSuccess(this.batchProcessing);
     } catch (err) {
-      console.error(err);
+      error(err);
       // If an error occur, we dont throw and loose everything, we just gonna reinject the rows we tried to injest:
       onFailed(this.batchProcessing);
     } finally {
@@ -105,17 +113,17 @@ class Bulker {
   }
 
   async finishLastBatchAndReenqueueWaitingEvents(queue: Queue) {
-    console.log(
+    log(
       `#${this.destinationClickhouseTable}: Wait for finishing the last batch..`
     );
     await new Promise((resolve) => {
       setInterval(() => {
         if (this.batchProcessingMetadata !== null) {
-          console.log(
+          log(
             `#${this.destinationClickhouseTable}: Still processing a batch...`
           );
         } else {
-          console.log(
+          log(
             `#${this.destinationClickhouseTable}: OK current batch processing is done.`
           );
           resolve(true);
@@ -123,14 +131,14 @@ class Bulker {
       }, 1000);
     });
     if (this.currentBatchToProcess.length > 0) {
-      console.log(
+      log(
         `#${this.destinationClickhouseTable}, Still has ${this.currentBatchToProcess.length} events that were waiting. Re-enqueue them:`
       );
       for (const eventData of this.currentBatchToProcess) {
         queue.add({ ...eventData }, { removeOnComplete: true });
       }
     }
-    console.log(`#${this.destinationClickhouseTable}: Done.`);
+    log(`#${this.destinationClickhouseTable}: Done.`);
   }
 }
 

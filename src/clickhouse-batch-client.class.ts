@@ -3,6 +3,7 @@ import { dayjs } from "./dayjs-utc.js";
 import snakeCase from "lodash.snakecase";
 import {
   CLICKHOUSE_NEW_COL_NULLABLE,
+  error,
   EVENT_TYPE_PROPERTY,
   EventDataValue,
   EventToInjest,
@@ -148,7 +149,7 @@ class ClickhouseBatchClient {
         query: sqlQuery,
       });
     } catch (err) {
-      console.error(sqlQuery);
+      error(sqlQuery);
       throw err;
     }
   }

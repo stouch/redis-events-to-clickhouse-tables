@@ -1,4 +1,4 @@
-import Queue from "bull";
+import Queue, { Job, type Queue as QueueType } from "bull";
 import Bulker from "./bulker.class.js";
 import { createClient } from "@clickhouse/client";
 import ClickhouseBatchClient from "./clickhouse-batch-client.class.js";
@@ -6,6 +6,33 @@ import * as fs from "fs";
 import dotenv from "dotenv";
 import { dayjs } from "./dayjs-utc.js";
 dotenv.config();
+
+export const log = (...strings: unknown[]) => {
+  strings.map((str) =>
+    console.log(`${dayjs().format("YYYY-MM-DDTHH:mm:ssZ[Z]")}: ${str}`)
+  );
+};
+export const error = (...strings: unknown[]) => {
+  strings.map((str) =>
+    console.error(
+      `${dayjs().format("YYYY-MM-DDTHH:mm:ssZ[Z]")}: [ERROR] ${str}`
+    )
+  );
+};
+export const warn = (...strings: unknown[]) => {
+  strings.map((str) =>
+    console.warn(
+      `${dayjs().format("YYYY-MM-DDTHH:mm:ssZ[Z]")}: [WARNING] ${str}`
+    )
+  );
+};
+export const debug = (...strings: unknown[]) => {
+  strings.map((str) =>
+    console.debug(
+      `${dayjs().format("YYYY-MM-DDTHH:mm:ssZ[Z]")}: [DEBUG] ${str}`
+    )
+  );
+};
 
 // Define process.env.REDIS_JOB_EVENT_TYPE_PROPERTY type:
 declare global {
@@ -25,6 +52,8 @@ declare global {
       DESTINATION_CLICKHOUSE_DB_PW?: string;
       DESTINATION_CLICKHOUSE_DB_NAME: string;
       BULK_REPEAT_INTERVAL_SEC: string; // In seconds
+      SOMETHING_IS_WRONG_DELAY_SEC: string; // In seconds
+      READ_MAX_CONCURRENCY: string;
       // Maximum per-batch INSERT INTO in the clickhouse db:
       TAKE_UP_TO_PER_BATCH: string; // Integer
       // Number of events we can keep in memory of the instance that hosts
@@ -128,31 +157,11 @@ if (BULKER_MAX_LENGTH < TAKE_UP_TO_PER_BATCH) {
 const BULKER_REPEAT_INTERVAL_MS =
   +(process.env.BULK_REPEAT_INTERVAL_SEC || 1) * 1000;
 
+const NB_CONCURRENCY = +(process.env.READ_MAX_CONCURRENCY || 1);
+
 // -----------------------------------
 // End of config variables definitions
 // -----------------------------------
-
-const queue = new Queue(
-  process.env.REDIS_BULL_EVENTS_QUEUNAME,
-  process.env.REDIS_BULL_DB
-);
-
-const destinationClickhouseClient = createClient({
-  url: process.env.DESTINATION_CLICKHOUSE_DB,
-  username: process.env.DESTINATION_CLICKHOUSE_DB_USER || undefined,
-  password: process.env.DESTINATION_CLICKHOUSE_DB_PW || undefined,
-  database: process.env.DESTINATION_CLICKHOUSE_DB_NAME,
-  clickhouse_settings:
-    process.env.USE_CLICKHOUSE_ASYNC_INSERT === "1"
-      ? {
-          async_insert: 1,
-          wait_for_async_insert: 1,
-        }
-      : undefined,
-});
-const emergencyBatchClient = new ClickhouseBatchClient(
-  destinationClickhouseClient
-);
 
 const trace = ({
   pre,
@@ -202,12 +211,39 @@ const trace = ({
   }
 };
 
+// We use a `let` because eventsQueue might be manually closed and recreated when something goes wrong
+//  see below `listenQueue({ queue: eventsQueue });` that initialize the listening of the queue:
+let eventsQueue = new Queue(
+  process.env.REDIS_BULL_EVENTS_QUEUNAME,
+  process.env.REDIS_BULL_DB
+);
+let lastQueueCreatedAt = dayjs().unix();
+let lastReadRedisEventAt: null | number = null;
+
+const destinationClickhouseClient = createClient({
+  url: process.env.DESTINATION_CLICKHOUSE_DB,
+  username: process.env.DESTINATION_CLICKHOUSE_DB_USER || undefined,
+  password: process.env.DESTINATION_CLICKHOUSE_DB_PW || undefined,
+  database: process.env.DESTINATION_CLICKHOUSE_DB_NAME,
+  clickhouse_settings:
+    process.env.USE_CLICKHOUSE_ASYNC_INSERT === "1"
+      ? {
+          async_insert: 1,
+          wait_for_async_insert: 1,
+        }
+      : undefined,
+});
+const emergencyBatchClient = new ClickhouseBatchClient(
+  destinationClickhouseClient
+);
+let lastPingShowsDisconnectedDestination = false;
+
 let bulkerInterval: NodeJS.Timeout = undefined;
 
 let onExit = async () => {};
 
 // We are in one the slave from here:
-console.log(`Hello, I'm worker ${process.pid}`);
+log(`Hello, I'm worker ${process.pid}`);
 
 // Store bulkers: One bulker per `eventName`
 //  `eventName` is supposed to be a snake_case string.
@@ -215,61 +251,13 @@ console.log(`Hello, I'm worker ${process.pid}`);
 const bulkers: Record<string, Bulker> = {};
 
 destinationClickhouseClient.ping().then((v) => {
-  console.log(`Destination DB : ${v.success ? "ON" : "OFF"}`);
+  log(`Destination DB : ${v.success ? "ON" : "OFF"}`);
+  lastPingShowsDisconnectedDestination = v.success;
 });
-queue.client.on("connecting", () => {
-  console.debug("Connecting...");
-});
-queue.client.on("reconnecting", () => {
-  console.debug("Reconnecting !...");
-});
-queue.client.on("ready", () => {
-  console.log("Ready");
-});
-queue.client.on("error", (err) => {
-  console.error("Queue client error !", err);
-});
-queue.on("failed", (job, _err) => {
-  // See .env.sample docs
-  if (process.env.RE_ENQUEUE_OLD_BULL_EVENTS === "1") {
-    if (job && job.name === process.env.RE_ENQUEUE_OLD_BULL_EVENTS_JOBNAME) {
-      // And these jobs have this strange timestamp in seconds: (While ms has timestamp str length >= 13)
-      if (job.timestamp && `${job.timestamp}`.length <= 10) {
-        const dataToReenqueue = job.data;
 
-        if (!dataToReenqueue.__received_at) {
-          // First time we process this failed event from `main` queue, let's flag its date:
-          dataToReenqueue.__received_at = dayjs().toDate();
-        }
-
-        trace({
-          pre: "re-enqueue:",
-          obj: dataToReenqueue,
-          outputSuffix: ".reenqueue.log",
-        });
-        queue.add(
-          {
-            ...dataToReenqueue,
-            __is_from_old_queue: true,
-          },
-          {
-            removeOnComplete: true,
-            // TODO: These strange events propably have a delay in seconds too,
-            //  but should we keep "delay"?
-            //  While our goal is to process events which are not supposed to be delayed anyway.
-            // delay: (job as any).delay ? (job as any).delay * 1000  : undefined
-            // For now, we just re-enqueue them.
-          }
-        );
-
-        // And request to remove this strange old job:
-        job.remove();
-      }
-    }
-  }
-});
-queue.process(async (job): Promise<boolean> => {
-  // console.log(`Job #${job.id} done by worker ${cluster.worker.id}`);
+const onReadRedisJob = async (job: Job<any>): Promise<boolean> => {
+  // log(`Job #${job.id} done by worker ${cluster.worker.id}`);
+  lastReadRedisEventAt = dayjs().unix();
 
   // An event is a simple Record<string, string | boolean | Date | number>
   // The Record keys as supposed to be in snake_case (if they're not, they gonna be converted):
@@ -278,7 +266,7 @@ queue.process(async (job): Promise<boolean> => {
   const eventName = eventData[EVENT_TYPE_PROPERTY];
 
   if (!eventName) {
-    console.error(`No ${EVENT_TYPE_PROPERTY} set`, eventData);
+    error(`No ${EVENT_TYPE_PROPERTY} set`, eventData);
     return true;
   }
 
@@ -289,7 +277,7 @@ queue.process(async (job): Promise<boolean> => {
   }
 
   if (eventData.__is_single_retry === true) {
-    console.debug(
+    debug(
       `Single failed event to process again... Attempt made: ${job.attemptsMade}. ID: ${job.id}`
     );
     try {
@@ -309,7 +297,7 @@ queue.process(async (job): Promise<boolean> => {
         obj: [eventData],
         outputSuffix: ".success.log",
       });
-      console.debug(`Single event success. ID: ${job.id}`);
+      debug(`Single event success. ID: ${job.id}`);
     } catch (err) {
       trace({
         pre: "process/failed-single/error:",
@@ -317,7 +305,7 @@ queue.process(async (job): Promise<boolean> => {
         full: true,
         outputSuffix: ".failedsingle.error.log",
       });
-      console.error(err);
+      error(err);
       throw err; // Throw error, and the job.backoff strategy is applied (see the below code of bulk processing).
     }
   } else {
@@ -345,7 +333,7 @@ queue.process(async (job): Promise<boolean> => {
       //  (and dont loose it neither because of too many attempts of `job` redis),
       //  so we just re-enqueue:
       if (err.message === "errors.bulker_full") {
-        console.warn(
+        warn(
           `Bulker is full, reenqueue event of ${eventData[EVENT_TYPE_PROPERTY]}:${eventData.__received_at} (${eventData.__bulker_full_attempts || 0})...`
         );
         // Just re-enqueue for later, whatever the attempts value is in current `job`:
@@ -355,7 +343,7 @@ queue.process(async (job): Promise<boolean> => {
           obj: eventData,
           outputSuffix: ".fullretrylater.log",
         });
-        queue.add(
+        eventsQueue.add(
           {
             ...eventData,
             __bulker_full_attempts: eventData.__bulker_full_attempts
@@ -376,7 +364,184 @@ queue.process(async (job): Promise<boolean> => {
   }
 
   return true;
-});
+};
+
+const onReadRedisFailed = (job: Job<any>, _err) => {
+  // See .env.sample docs,
+  // This case mostly occurs when a redis event is incompatible with the __default__ job name
+  if (process.env.RE_ENQUEUE_OLD_BULL_EVENTS === "1") {
+    if (job && job.name === process.env.RE_ENQUEUE_OLD_BULL_EVENTS_JOBNAME) {
+      // And these jobs have this strange timestamp in seconds: (While ms has timestamp str length >= 13)
+      if (job.timestamp && `${job.timestamp}`.length <= 10) {
+        const dataToReenqueue = job.data;
+
+        if (!dataToReenqueue.__received_at) {
+          // First time we process this failed event from `main` queue, let's flag its date:
+          dataToReenqueue.__received_at = dayjs().toDate();
+        }
+
+        trace({
+          pre: "re-enqueue:",
+          obj: dataToReenqueue,
+          outputSuffix: ".reenqueue.log",
+        });
+        eventsQueue.add(
+          {
+            ...dataToReenqueue,
+            __is_from_old_queue: true,
+          },
+          {
+            removeOnComplete: true,
+            // TODO: These strange events propably have a delay in seconds too,
+            //  but should we keep "delay"?
+            //  While our goal is to process events which are not supposed to be delayed anyway.
+            // delay: (job as any).delay ? (job as any).delay * 1000  : undefined
+            // For now, we just re-enqueue them.
+          }
+        );
+
+        // And request to remove this strange old job:
+        job.remove();
+      }
+    }
+  }
+};
+
+// --------------------------------------
+// ---------- Bind redis queue ----------
+// --------------------------------------
+
+const listenQueue = ({ queue }: { queue: QueueType }) => {
+  queue.client.on("connecting", () => {
+    debug("Connecting...");
+  });
+  queue.client.on("reconnecting", () => {
+    debug("Reconnecting !...");
+  });
+  queue.client.on("ready", () => {
+    log("Ready");
+  });
+  queue.client.on("end", () => {
+    warn("Queue ended!");
+  });
+  queue.client.on("close", () => {
+    warn("Queue closed.");
+  });
+  queue.client.on("error", (err) => {
+    error("Queue client error !", err);
+  });
+  queue.on("failed", onReadRedisFailed);
+  queue.process(NB_CONCURRENCY, onReadRedisJob);
+};
+// .. and listen:
+listenQueue({ queue: eventsQueue });
+
+// ------------------------------------------------
+// ------------------------------------------------
+// Status checking on repeated interval -----------
+// ------------------------------------------------
+// ------------------------------------------------
+
+let recreating = false;
+let recreateInterval: NodeJS.Timeout | null = null;
+// Check if we need to re-create a Redis Queue connection if something looks wrong with no new read events since some delay:
+const SOMETHING_IS_WRONG_DELAY_SEC = +(
+  process.env.SOMETHING_IS_WRONG_DELAY_SEC || 60 * 2
+); // When we dont get any new events for more than this delay, something will be judged as wrong.
+const SOMETHING_IS_WRONG_CHECK_EVERY_SEC = 10;
+recreateInterval = setInterval(async () => {
+  if (recreating) {
+    warn("Still recreating..");
+  }
+  const someLongTimeAgo = dayjs()
+    .subtract(SOMETHING_IS_WRONG_DELAY_SEC, "second")
+    .unix();
+  const now = dayjs().unix();
+  if (now > lastQueueCreatedAt + 10) {
+    if (
+      (lastReadRedisEventAt === null && lastQueueCreatedAt < someLongTimeAgo) ||
+      lastReadRedisEventAt < someLongTimeAgo
+    ) {
+      warn(
+        `Something is wrong, we got no new event processed from Redis since ${someLongTimeAgo}. Might means the queue socket is dead. Re-create the queue:`
+      );
+      recreating = true;
+
+      // First, completely close the queue, ignoring errors because we are going to re-create anyway
+      try {
+        await eventsQueue.close();
+      } catch (err) {
+        error(`${err}`);
+      }
+
+      // Before full create a new Redis Queue listening, clean what might stay from the previously closed queue:
+      let oneOfBulkerHasWaitingEvents = false;
+      for (const eventName in bulkers) {
+        const nbWaitingEvents = bulkers[eventName].getBulkWaitingQueueLength();
+        const nbProcessingEvents = bulkers[eventName].getBulkingQueueLength();
+        if (nbWaitingEvents > 0 || nbProcessingEvents > 0) {
+          warn(
+            `That looks even wronger, because we still got processing/waiting event (waiting: ${nbWaitingEvents}, processing: ${nbProcessingEvents}).`
+          );
+          log(
+            "We gonna wait the processing been pushed to destination, and gonna re-enqueue waiting events.."
+          );
+          oneOfBulkerHasWaitingEvents = true;
+        }
+      }
+      if (oneOfBulkerHasWaitingEvents) {
+        const waitingEventsQueue = new Queue(
+          process.env.REDIS_BULL_EVENTS_QUEUNAME,
+          process.env.REDIS_BULL_DB
+        );
+        await new Promise((resolve) => {
+          waitingEventsQueue.client.on("ready", () => {
+            log("Ready");
+            resolve(true);
+          });
+        });
+        for (const eventName in bulkers) {
+          log(`Re-inject bulker waiting events for ${eventName} queue...`);
+          await bulkers[eventName].finishLastBatchAndReenqueueWaitingEvents(
+            waitingEventsQueue
+          );
+        }
+      }
+
+      //
+      // And recreate/reset the listening of the new queue
+      //  using the global variable:
+      eventsQueue = null;
+      eventsQueue = new Queue(
+        process.env.REDIS_BULL_EVENTS_QUEUNAME,
+        process.env.REDIS_BULL_DB
+      );
+      lastQueueCreatedAt = dayjs().unix();
+      listenQueue({ queue: eventsQueue });
+
+      recreating = false;
+    }
+  }
+}, SOMETHING_IS_WRONG_CHECK_EVERY_SEC * 1000);
+
+//
+// Check the destination database status:
+setInterval(() => {
+  destinationClickhouseClient.ping().then((v) => {
+    log(`Check destination DB : ${v.success ? "ON" : "OFF"}`);
+    lastPingShowsDisconnectedDestination = v.success;
+  });
+}, 30 * 1000);
+
+//
+// Check how are filled the bulkers:
+setInterval(() => {
+  for (const eventName in bulkers) {
+    log(
+      `Bulker #${eventName} has ${bulkers[eventName].getBulkingQueueLength()} processing, and ${bulkers[eventName].getBulkWaitingQueueLength()} pending jobs`
+    );
+  }
+}, 20 * 1000);
 
 // ------------------------------------------------
 // ------------------------------------------------
@@ -384,6 +549,13 @@ queue.process(async (job): Promise<boolean> => {
 // ------------------------------------------------
 // ------------------------------------------------
 bulkerInterval = setInterval(() => {
+  if (!lastPingShowsDisconnectedDestination) {
+    error(
+      `Wait.. Destination clickhouse is disconnected. We have wait it comes back, or kill this app to re-enqueue waiting Bulker events.`
+    );
+    return;
+  }
+
   // For each bulker (meaning each `eventName`):
   for (const eventName in bulkers) {
     // We request for a batch to be process:
@@ -396,6 +568,7 @@ bulkerInterval = setInterval(() => {
         });
       },
       onFailed: (failedEvents) => {
+        error(`Batching of ${eventName} failed ${failedEvents.length} events`);
         // Here is the way we process the failed events:
         //  These are gonna be spread in the future, using an unitary processing, because it's too hard to split sub-batches of them:
         const failDelayMs = 2 * 1000;
@@ -405,7 +578,7 @@ bulkerInterval = setInterval(() => {
             obj: failedEvent,
             outputSuffix: ".bulkjobfailed.log",
           });
-          queue.add(
+          eventsQueue.add(
             {
               ...failedEvent,
               [EVENT_TYPE_PROPERTY]: eventName, // <-- already in `failedEvent`, but let's set it again to be clear.
@@ -432,14 +605,40 @@ bulkerInterval = setInterval(() => {
 // --- Gracefully stop a bulker and re-enqueue the events that were waiting in it ----
 // -----------------------------------------------------------------------------------
 onExit = async () => {
-  console.log("Stop the repeated bulk INSERT.");
+  log("Stop the repeated bulk INSERT.");
   bulkerInterval && clearInterval(bulkerInterval);
   bulkerInterval = null;
 
-  console.log("Close the queue (stop to .process() any redis job!)");
-  queue.close();
+  recreateInterval && clearInterval(recreateInterval);
+  recreateInterval = null;
+  if (recreating) {
+    warn("Wait! A recreating was occurring, just wait it to be done:");
+    await new Promise((resolve) => {
+      setInterval(() => {
+        if (recreating) {
+          warn(
+            "...Wait, a recreating was occurring, just wait it to be done..."
+          );
+        } else {
+          log(
+            `OK recreating is done, we can gracefully close the current Redis queue.`
+          );
+          resolve(true);
+        }
+      }, 1000);
+    });
+  }
 
-  console.log(
+  log(
+    "Close the queue (stop to .process() any redis job!), and ignore error.."
+  );
+  try {
+    await eventsQueue.close();
+  } catch (err) {
+    error(`${err}`);
+  }
+
+  log(
     "Open a queue just to reinject if there are some waiting events in `currentBatchToProcess`..."
   );
   const waitingEventsQueue = new Queue(
@@ -448,21 +647,21 @@ onExit = async () => {
   );
   await new Promise((resolve) => {
     waitingEventsQueue.client.on("ready", () => {
-      console.log("Ready");
+      log("Ready");
       resolve(true);
     });
   });
   for (const eventName in bulkers) {
-    console.log(`Re-inject bulker waiting events for ${eventName} queue...`);
+    log(`Re-inject bulker waiting events for ${eventName} queue...`);
     await bulkers[eventName].finishLastBatchAndReenqueueWaitingEvents(
       waitingEventsQueue
     );
   }
-  console.log("We can exit !");
+  log("We can exit !");
 };
 
 const gracefulShutdown = async () => {
-  console.log(`Shutting down Worker ${process.pid} gracefully...`);
+  log(`Shutting down Worker ${process.pid} gracefully...`);
   onExit && (await onExit());
   process.exit(0);
 };

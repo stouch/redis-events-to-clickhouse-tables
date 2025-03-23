@@ -20,7 +20,9 @@ const queue = new Queue("event-track", "redis://<redis-server>:6379");
 
 // Trace an *event*
 queue.add({
+  // These two keys are required
   event_type: "<some_event_name>",
+  fired_at: new Date(),
   // .. and the event content:
   some_key: "Some information to log",
   some_key_about_a_number: 23,
@@ -49,6 +51,8 @@ npm run buid
 
 # You can use a nohup, or a docker container, to run this forever:
 node build/src/inject.js
+
+# CTRL+C will gracefully kill the bulking waiting events, and re-enqueue them in Redis queues if they are not done.
 ```
 
 In case you want to apply some transformation to your events, override the `src/transform.ts` file. (see docker-compose..yml)
@@ -59,6 +63,11 @@ Check the _environment_ variables in `docker-compose.yml`, and just run:
 
 ```bash
 docker compose up -d
+```
+
+In case you want to kill the container, use a high timeout :
+```bash
+docker stop -t 600 <container>
 ```
 
 ### 3. We're done 🥳, track your Clickhouse database events !
