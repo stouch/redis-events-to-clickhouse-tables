@@ -50,7 +50,7 @@ npm ci
 npm run buid
 
 # You can use a nohup, or a docker container, to run this forever:
-node build/src/inject.js
+node build/src/main.js
 
 # CTRL+C will gracefully kill the bulking waiting events, and re-enqueue them in Redis queues if they are not done.
 ```
