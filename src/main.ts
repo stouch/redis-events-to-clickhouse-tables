@@ -538,10 +538,10 @@ recreateInterval = setInterval(async () => {
         const nbProcessingEvents = bulkers[eventName].getBulkingQueueLength();
         if (nbWaitingEvents > 0 || nbProcessingEvents > 0) {
           warn(
-            `That looks even wronger, because we still got processing/waiting event (waiting: ${nbWaitingEvents}, processing: ${nbProcessingEvents}).`
+            `#${eventName}: That looks even wronger, because we still got processing/waiting event (waiting: ${nbWaitingEvents}, processing: ${nbProcessingEvents}).`
           );
           log(
-            "We gonna wait the processing been pushed to destination, and gonna re-enqueue waiting events.."
+            `#${eventName}: We gonna wait the processing been pushed to destination, and gonna re-enqueue waiting events..`
           );
           oneOfBulkerHasWaitingEvents = true;
         }
