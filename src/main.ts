@@ -407,6 +407,59 @@ const onReadRedisFailed = (job: Job<any>, _err) => {
   }
 };
 
+const bulkingIntervalFunction = () => {
+  if (!lastPingShowsDisconnectedDestination) {
+    error(
+      `Wait.. Destination clickhouse is disconnected. We have wait it comes back, or kill this app to re-enqueue waiting Bulker events.`
+    );
+    return;
+  }
+
+  // For each bulker (meaning each `eventName`):
+  for (const eventName in bulkers) {
+    // We request for a batch to be process:
+    bulkers[eventName].processBatch({
+      onSuccess: (successedEvents) => {
+        trace({
+          pre: "success:",
+          obj: successedEvents,
+          outputSuffix: ".success.log",
+        });
+      },
+      onFailed: (failedEvents) => {
+        error(`Batching of ${eventName} failed ${failedEvents.length} events`);
+        // Here is the way we process the failed events:
+        //  These are gonna be spread in the future, using an unitary processing, because it's too hard to split sub-batches of them:
+        const failDelayMs = 2 * 1000;
+        for (const failedEvent of failedEvents) {
+          trace({
+            pre: "enqueue/failed:",
+            obj: failedEvent,
+            outputSuffix: ".bulkjobfailed.log",
+          });
+          eventsQueue.add(
+            {
+              ...failedEvent,
+              [EVENT_TYPE_PROPERTY]: eventName, // <-- already in `failedEvent`, but let's set it again to be clear.
+              __is_single_retry: true, // As mentioned, it will not be process here anymore in the bulk processing (see above code in the queue.process())
+            },
+            {
+              removeOnComplete: true,
+              delay: failDelayMs,
+              backoff: {
+                // .. and make the unitary retry with an exponential backoff:
+                type: "exponential",
+                delay: 3 * 1000,
+              },
+              attempts: 5, // And try few times at least.
+            }
+          );
+        }
+      },
+    });
+  }
+};
+
 // --------------------------------------
 // ---------- Bind redis queue ----------
 // --------------------------------------
@@ -467,6 +520,10 @@ recreateInterval = setInterval(async () => {
       );
       recreating = true;
 
+      debug(`Temporary pause the bulker interval`);
+      bulkerInterval && clearInterval(bulkerInterval);
+      bulkerInterval = null;
+
       // First, completely close the queue, ignoring errors because we are going to re-create anyway
       try {
         await eventsQueue.close();
@@ -522,6 +579,12 @@ recreateInterval = setInterval(async () => {
       lastQueueCreatedAt = dayjs().unix();
       listenQueue({ queue: eventsQueue });
 
+      log("Restart the bulker interval.");
+      bulkerInterval = setInterval(
+        bulkingIntervalFunction,
+        BULKER_REPEAT_INTERVAL_MS
+      );
+
       recreating = false;
     }
   }
@@ -551,58 +614,10 @@ setInterval(() => {
 // Bulker processing (forever Interval repeating)
 // ------------------------------------------------
 // ------------------------------------------------
-bulkerInterval = setInterval(() => {
-  if (!lastPingShowsDisconnectedDestination) {
-    error(
-      `Wait.. Destination clickhouse is disconnected. We have wait it comes back, or kill this app to re-enqueue waiting Bulker events.`
-    );
-    return;
-  }
-
-  // For each bulker (meaning each `eventName`):
-  for (const eventName in bulkers) {
-    // We request for a batch to be process:
-    bulkers[eventName].processBatch({
-      onSuccess: (successedEvents) => {
-        trace({
-          pre: "success:",
-          obj: successedEvents,
-          outputSuffix: ".success.log",
-        });
-      },
-      onFailed: (failedEvents) => {
-        error(`Batching of ${eventName} failed ${failedEvents.length} events`);
-        // Here is the way we process the failed events:
-        //  These are gonna be spread in the future, using an unitary processing, because it's too hard to split sub-batches of them:
-        const failDelayMs = 2 * 1000;
-        for (const failedEvent of failedEvents) {
-          trace({
-            pre: "enqueue/failed:",
-            obj: failedEvent,
-            outputSuffix: ".bulkjobfailed.log",
-          });
-          eventsQueue.add(
-            {
-              ...failedEvent,
-              [EVENT_TYPE_PROPERTY]: eventName, // <-- already in `failedEvent`, but let's set it again to be clear.
-              __is_single_retry: true, // As mentioned, it will not be process here anymore in the bulk processing (see above code in the queue.process())
-            },
-            {
-              removeOnComplete: true,
-              delay: failDelayMs,
-              backoff: {
-                // .. and make the unitary retry with an exponential backoff:
-                type: "exponential",
-                delay: 3 * 1000,
-              },
-              attempts: 5, // And try few times at least.
-            }
-          );
-        }
-      },
-    });
-  }
-}, BULKER_REPEAT_INTERVAL_MS);
+bulkerInterval = setInterval(
+  bulkingIntervalFunction,
+  BULKER_REPEAT_INTERVAL_MS
+);
 
 // -----------------------------------------------------------------------------------
 // --- Gracefully stop a bulker and re-enqueue the events that were waiting in it ----
@@ -631,6 +646,9 @@ onExit = async () => {
       }, 1000);
     });
   }
+
+  bulkerInterval && clearInterval(bulkerInterval);
+  bulkerInterval = null;
 
   log(
     "Close the queue (stop to .process() any redis job!), and ignore error.."
