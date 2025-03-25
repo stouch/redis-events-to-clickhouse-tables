@@ -116,8 +116,9 @@ class Bulker {
     log(
       `#${this.destinationClickhouseTable}: Wait for finishing the last batch..`
     );
+    let statusInterval: NodeJS.Timeout | null = null;
     await new Promise((resolve) => {
-      setInterval(() => {
+      statusInterval = setInterval(() => {
         if (this.batchProcessingMetadata !== null) {
           log(
             `#${this.destinationClickhouseTable}: Still processing a batch...`
@@ -126,6 +127,7 @@ class Bulker {
           log(
             `#${this.destinationClickhouseTable}: OK current batch processing is done.`
           );
+          clearInterval(statusInterval);
           resolve(true);
         }
       }, 1000);

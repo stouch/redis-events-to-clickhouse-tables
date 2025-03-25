@@ -575,7 +575,7 @@ recreateInterval = setInterval(async () => {
       eventsQueue = new Queue(
         process.env.REDIS_BULL_EVENTS_QUEUNAME,
         process.env.REDIS_BULL_DB
-      ); 
+      );
       lastQueueCreatedAt = dayjs().unix();
       listenQueue({ queue: eventsQueue });
 
@@ -624,15 +624,14 @@ bulkerInterval = setInterval(
 // -----------------------------------------------------------------------------------
 onExit = async () => {
   log("Stop the repeated bulk INSERT.");
-  bulkerInterval && clearInterval(bulkerInterval);
-  bulkerInterval = null;
 
   recreateInterval && clearInterval(recreateInterval);
   recreateInterval = null;
   if (recreating) {
     warn("Wait! A recreating was occurring, just wait it to be done:");
+    let recreatingStatusInterval: NodeJS.Timeout | null = null;
     await new Promise((resolve) => {
-      setInterval(() => {
+      recreatingStatusInterval = setInterval(() => {
         if (recreating) {
           warn(
             "...Wait, a recreating was occurring, just wait it to be done..."
@@ -641,6 +640,7 @@ onExit = async () => {
           log(
             `OK recreating is done, we can gracefully close the current Redis queue.`
           );
+          clearInterval(recreatingStatusInterval);
           resolve(true);
         }
       }, 1000);
