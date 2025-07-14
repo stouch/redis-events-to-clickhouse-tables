@@ -299,6 +299,7 @@ const onReadRedisJob = async (job: Job<any>): Promise<boolean> => {
       });
       debug(`Single event success. ID: ${job.id}`);
     } catch (err) {
+      error(`Failing ${JSON.stringify(eventData)}`);
       trace({
         pre: "process/failed-single/error:",
         obj: eventData,

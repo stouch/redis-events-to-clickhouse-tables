@@ -129,7 +129,7 @@ class ClickhouseBatchClient {
       throw new Error("errors.no_prepared_schema");
     }
     if (this.preparedRows === null) {
-      throw new Error("errors.no_prepared_schema");
+      throw new Error("errors.no_prepared_schema_rows");
     }
     const rowsQueries = this.getClickhouseRowsSql({
       rowsData: this.preparedRows,
