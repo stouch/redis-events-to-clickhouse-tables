@@ -54,6 +54,7 @@ declare global {
       BULK_REPEAT_INTERVAL_SEC: string; // In seconds
       SOMETHING_IS_WRONG_DELAY_SEC: string; // In seconds
       READ_MAX_CONCURRENCY: string;
+      NON_CRITICAL_EVENT_TYPES: string;
       // Maximum per-batch INSERT INTO in the clickhouse db:
       TAKE_UP_TO_PER_BATCH: string; // Integer
       // Number of events we can keep in memory of the instance that hosts
@@ -105,6 +106,7 @@ export type EventToInjest = {
   [key in typeof process.env.REDIS_JOB_EVENT_TYPE_PROPERTY]: string;
 } & {
   __is_single_retry?: true;
+  __single_retry_attempts?: number;
   __is_from_old_queue?: true; // In case it's an event that was initially in `RE_ENQUEUE_OLD_BULL_EVENTS_JOBNAME`
   __bulker_full_attempts?: number; // Store this in the event for how many times we tried the event but bulker was full so we re-enqueued it.
   __received_at?: Date | string;
@@ -158,6 +160,8 @@ const BULKER_REPEAT_INTERVAL_MS =
   +(process.env.BULK_REPEAT_INTERVAL_SEC || 1) * 1000;
 
 const NB_CONCURRENCY = +(process.env.READ_MAX_CONCURRENCY || 1);
+
+const NON_CRITICAL_EVENT_TYPES = (process.env.NON_CRITICAL_EVENT_TYPES || '') ? (process.env.NON_CRITICAL_EVENT_TYPES || '').split(',') : [];
 
 // -----------------------------------
 // End of config variables definitions
@@ -233,6 +237,7 @@ const destinationClickhouseClient = createClient({
         }
       : undefined,
 });
+let isEmergencyBatchClientBeingUsed = false;
 const emergencyBatchClient = new ClickhouseBatchClient(
   destinationClickhouseClient
 );
@@ -277,37 +282,84 @@ const onReadRedisJob = async (job: Job<any>): Promise<boolean> => {
   }
 
   if (eventData.__is_single_retry === true) {
-    debug(
-      `Single failed event to process again... Attempt made: ${job.attemptsMade}. ID: ${job.id}`
-    );
-    try {
-      // This case is when an event has failed in the bulker,
-      // This unitary try can throw (see the below code of bulk processing):
-      trace({
-        pre: "process/failed-single:",
-        obj: eventData,
-        outputSuffix: ".failedsingle.process.log",
-      });
-      await emergencyBatchClient.prepareSchemaAndInjest({
-        tableName: eventName,
-        rows: [eventData],
-      });
-      trace({
-        pre: "success:",
-        obj: [eventData],
-        outputSuffix: ".success.log",
-      });
-      debug(`Single event success. ID: ${job.id}`);
-    } catch (err) {
-      error(`Failing ${JSON.stringify(eventData)}`);
-      trace({
-        pre: "process/failed-single/error:",
-        obj: eventData,
-        full: true,
-        outputSuffix: ".failedsingle.error.log",
-      });
-      error(err);
-      throw err; // Throw error, and the job.backoff strategy is applied (see the below code of bulk processing).
+
+    //
+    // `emergencyBatchClient` might be used by multiple table names in `NB_CONCURRENCY` parallel threads 
+    //   because `onReadRedisJob` is parallelized.
+    //
+    // We must prevent this (because a same ClickhouseBatchClient must never be used in parallel):
+    //
+    if(isEmergencyBatchClientBeingUsed){
+      // warn(
+      //    `The singleton emergency client is pending, reenqueue event of ${eventData[EVENT_TYPE_PROPERTY]}:${eventData.__received_at} (${eventData.__single_retry_attempts || 0})...`
+      // );
+      if(eventData.__single_retry_attempts && eventData.__single_retry_attempts > 1 && NON_CRITICAL_EVENT_TYPES && NON_CRITICAL_EVENT_TYPES.includes(eventData[EVENT_TYPE_PROPERTY])){
+        log(`${eventData[EVENT_TYPE_PROPERTY]} ignored in case of too many errors.`)
+
+      }else{
+        // Just re-enqueue for later, whatever the attempts value is in current `job`:
+        const bulkerFullDelayMs = 1000 + (Math.floor(Math.random() * 10) + 1) * 1000; // A value between 1 and 11 seconds
+        trace({
+          pre: "enqueue/forlater:",
+          obj: eventData,
+          outputSuffix: ".fullretrylater.log",
+        });
+        eventsQueue.add(
+          {
+            ...eventData,
+            __single_retry_attempts: eventData.__single_retry_attempts
+              ? eventData.__single_retry_attempts + 1
+              : 1,
+          },
+          {
+            removeOnComplete: true,
+            delay: bulkerFullDelayMs,
+            // attempts: 1 // Dont set attempts because retry is made by accepting the event
+            //  and re-injecting it (like we are doing here)
+          }
+        );
+      }
+      
+    }else{
+      
+      debug(
+        `Single failed event to process again... Attempt made: ${job.attemptsMade}. ID: ${job.id}`
+      );
+      try {
+        isEmergencyBatchClientBeingUsed = true;
+        // This case is when an event has failed in the bulker,
+        // This unitary try can throw (see the below code of bulk processing):
+        trace({
+          pre: "process/failed-single:",
+          obj: eventData,
+          outputSuffix: ".failedsingle.process.log",
+        });
+
+        await emergencyBatchClient.prepareSchema({ 
+          tableName: eventName,
+          rows: [eventData]
+        });
+        await emergencyBatchClient.insertRows();
+
+        trace({
+          pre: "success:",
+          obj: [eventData],
+          outputSuffix: ".success.log",
+        });
+        debug(`Single event success. ID: ${job.id}`);
+      } catch (err) {
+        trace({
+          pre: "process/failed-single/error:",
+          obj: eventData,
+          full: true,
+          outputSuffix: ".failedsingle.error.log",
+        });
+        error(err);
+        throw err; // Throw error, and the job.backoff strategy is applied (see the below code of bulk processing).
+      } finally {
+        isEmergencyBatchClientBeingUsed = false;
+      }
+    
     }
   } else {
     // If the `eventName` bulker does not exist yet:

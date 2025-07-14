@@ -103,7 +103,7 @@ class Bulker {
       await this.clickhouseBatchClient.insertRows();
       onSuccess(this.batchProcessing);
     } catch (err) {
-      error(err);
+      error(`Error processBatch in ${this.destinationClickhouseTable} : ${err}`);
       // If an error occur, we dont throw and loose everything, we just gonna reinject the rows we tried to injest:
       onFailed(this.batchProcessing);
     } finally {

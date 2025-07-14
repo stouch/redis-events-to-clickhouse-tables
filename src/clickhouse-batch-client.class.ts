@@ -50,6 +50,9 @@ type ColumnName = string;
 type ClickhouseTableSchema = Record<ColumnName, ClickhouseColumnDefinition>;
 
 /**
+ * 
+ * /!\ NEVER USE a single client in parallel.
+ * 
  * This class allows to batch-insert rows in a Clickhouse database, by:
  *
  * - Analyzing rows we want to batch-insert in the according Clickhouse table:
@@ -64,8 +67,6 @@ type ClickhouseTableSchema = Record<ColumnName, ClickhouseColumnDefinition>;
  *
  * - Insert the rows in the according Clickhouse table:
  *   Method: `insertRows`
- *
- * We can also use method: `prepareSchemaAndInjest`, which does both at same time.
  *
  */
 class ClickhouseBatchClient {
@@ -93,34 +94,42 @@ class ClickhouseBatchClient {
     tableName: TableName;
     rows: EventToInjest[];
   }): Promise<void> {
-    if (rows.length === 0) {
-      throw new Error("errors.no_rows_to_insert");
-    }
-    this.preparedRows = this.prepareRows(rows);
-    const requestedSchema = this.getRowsMinimumSchema(this.preparedRows);
-    if (Object.keys(requestedSchema).length === 0) {
-      throw new Error("errors.no_columns_found");
-    }
-    const tableExists = await this.doesTableExist(tableName);
-    if (tableExists) {
-      const existingSchema = await this.getClickhouseTableSchema(tableName);
-      this.preparedSchema = {
-        table: tableName,
-        schema: await this.addMissingColumns({
+    try {
+      
+      if (rows.length === 0) {
+        throw new Error("errors.no_rows_to_insert");
+      }
+      this.preparedRows = this.prepareRows(rows);
+      
+      const requestedSchema = this.getRowsMinimumSchema(this.preparedRows);
+      if (Object.keys(requestedSchema).length === 0) {
+        throw new Error("errors.no_columns_found");
+      }
+      const tableExists = await this.doesTableExist(tableName);
+      if (tableExists) {
+        const existingSchema = await this.getClickhouseTableSchema(tableName);
+        this.preparedSchema = {
+          table: tableName,
+          schema: await this.addMissingColumns({
+            tableName,
+            currentSchema: existingSchema,
+            // In `addMissingColumns`, we may update `requestedSchema` if the `existingSchema` is a bit different
+            //  for example the requested DateTime64(6) is probably just a DateTime (see `addMissingColumns`)
+            requestedSchema: requestedSchema,
+          }),
+        };
+      } else {
+        await this.createTable({
           tableName,
-          currentSchema: existingSchema,
-          // In `addMissingColumns`, we may update `requestedSchema` if the `existingSchema` is a bit different
-          //  for example the requested DateTime64(6) is probably just a DateTime (see `addMissingColumns`)
           requestedSchema: requestedSchema,
-        }),
-      };
-    } else {
-      await this.createTable({
-        tableName,
-        requestedSchema: requestedSchema,
-      });
+        });
 
-      this.preparedSchema = { table: tableName, schema: requestedSchema };
+        this.preparedSchema = { table: tableName, schema: requestedSchema };
+      }
+
+    } catch (err) {
+      error(`Error preparing schema with ${tableName} because ${err}`);
+      throw err;
     }
   }
 
@@ -150,21 +159,6 @@ class ClickhouseBatchClient {
       });
     } catch (err) {
       error(sqlQuery);
-      throw err;
-    }
-  }
-
-  async prepareSchemaAndInjest({
-    tableName,
-    rows,
-  }: {
-    tableName: TableName;
-    rows: EventToInjest[];
-  }) {
-    try {
-      await this.prepareSchema({ tableName, rows });
-      await this.insertRows();
-    } catch (err) {
       throw err;
     }
   }
@@ -203,6 +197,7 @@ class ClickhouseBatchClient {
       if (
         eventKey === EVENT_TYPE_PROPERTY ||
         eventKey === "__is_single_retry" ||
+        eventKey === "__single_retry_attempts" ||
         eventKey === "__is_from_old_queue" ||
         eventKey === "__bulker_full_attempts" ||
         eventKey === "__received_at"
@@ -279,19 +274,29 @@ class ClickhouseBatchClient {
 
   // Ensure we gonna use column names in snake_case, and that we aint going to persist "event_type" (${EVENT_TYPE_PROPERTY}) from the redis bull event job.
   private prepareRows(rows: EventToInjest[]): Record<string, EventDataValue>[] {
-    return rows.map((row) => {
-      const rowWithPrimaryKey: Record<string, EventDataValue> = {
-        ...this.prepareRowColumns(row),
-        [`${RECEIVED_AT_TS_COLUMN_NAME}`]:
-          typeof row.__received_at === "string"
-            ? dayjs(row.__received_at).toDate()
-            : row.__received_at,
-        [`${SENT_AT_TS_COLUMN_NAME}`]: dayjs().toDate(),
-        [`${MID_COLUMN_NAME}`]: `${randomUUID()}`,
-      };
-      // Apply the custom-transform (if it's defined):
-      return transform(rowWithPrimaryKey, row);
-    });
+    try{
+      return rows.map((row) => {
+        try{
+          const rowWithPrimaryKey: Record<string, EventDataValue> = {
+            ...this.prepareRowColumns(row),
+            [`${RECEIVED_AT_TS_COLUMN_NAME}`]:
+              typeof row.__received_at === "string"
+                ? dayjs(row.__received_at).toDate()
+                : row.__received_at,
+            [`${SENT_AT_TS_COLUMN_NAME}`]: dayjs().toDate(),
+            [`${MID_COLUMN_NAME}`]: `${randomUUID()}`,
+          };
+          // Apply the custom-transform (if it's defined):
+          return transform(rowWithPrimaryKey, row);
+        }catch(err){
+          error(`Error with a row injestion : ${JSON.stringify(row)}: ${err}`)
+          throw err;
+        }
+      });
+    }catch(err){
+      error(`Error preparing rows: ${err}`);
+      throw err;
+    }
   }
 
   private getClickhouseColumnsSql(
@@ -584,7 +589,8 @@ class ClickhouseBatchClient {
         query: `SELECT * FROM ${tableName} LIMIT 1`,
       });
       return true;
-    } catch {
+    } catch(err) {
+      error(`Cannot select ${tableName}: ${err}`)
       return false;
     }
   }
