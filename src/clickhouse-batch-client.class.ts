@@ -50,9 +50,9 @@ type ColumnName = string;
 type ClickhouseTableSchema = Record<ColumnName, ClickhouseColumnDefinition>;
 
 /**
- * 
+ *
  * /!\ NEVER USE a single client in parallel.
- * 
+ *
  * This class allows to batch-insert rows in a Clickhouse database, by:
  *
  * - Analyzing rows we want to batch-insert in the according Clickhouse table:
@@ -95,12 +95,11 @@ class ClickhouseBatchClient {
     rows: EventToInjest[];
   }): Promise<void> {
     try {
-      
       if (rows.length === 0) {
         throw new Error("errors.no_rows_to_insert");
       }
       this.preparedRows = this.prepareRows(rows);
-      
+
       const requestedSchema = this.getRowsMinimumSchema(this.preparedRows);
       if (Object.keys(requestedSchema).length === 0) {
         throw new Error("errors.no_columns_found");
@@ -126,7 +125,6 @@ class ClickhouseBatchClient {
 
         this.preparedSchema = { table: tableName, schema: requestedSchema };
       }
-
     } catch (err) {
       error(`Error preparing schema with ${tableName} because ${err}`);
       throw err;
@@ -144,10 +142,12 @@ class ClickhouseBatchClient {
       rowsData: this.preparedRows,
       requestedSchema: this.preparedSchema.schema,
     });
+
     const sqlQuery = `INSERT INTO ${this.preparedSchema.table} 
       (${Object.keys(this.preparedSchema.schema).join(",")}) VALUES 
         (${rowsQueries.join(`),
         (`)});`;
+
     try {
       // Ensure we waint going to double-insert:
       this.preparedRows = null;
@@ -274,9 +274,9 @@ class ClickhouseBatchClient {
 
   // Ensure we gonna use column names in snake_case, and that we aint going to persist "event_type" (${EVENT_TYPE_PROPERTY}) from the redis bull event job.
   private prepareRows(rows: EventToInjest[]): Record<string, EventDataValue>[] {
-    try{
+    try {
       return rows.map((row) => {
-        try{
+        try {
           const rowWithPrimaryKey: Record<string, EventDataValue> = {
             ...this.prepareRowColumns(row),
             [`${RECEIVED_AT_TS_COLUMN_NAME}`]:
@@ -288,12 +288,12 @@ class ClickhouseBatchClient {
           };
           // Apply the custom-transform (if it's defined):
           return transform(rowWithPrimaryKey, row);
-        }catch(err){
-          error(`Error with a row injestion : ${JSON.stringify(row)}: ${err}`)
+        } catch (err) {
+          error(`Error with a row injestion : ${JSON.stringify(row)}: ${err}`);
           throw err;
         }
       });
-    }catch(err){
+    } catch (err) {
       error(`Error preparing rows: ${err}`);
       throw err;
     }
@@ -344,6 +344,13 @@ class ClickhouseBatchClient {
           colType === ColumnType.DATE64
             ? "YYYY-MM-DD HH:mm:ss.SSS"
             : "YYYY-MM-DD HH:mm:ss";
+        // We have to escape the double-quotes (`.replace(/"/g, '\\"')`) in the string, because,
+        //  even if they dont make the query invalid, if we dont escape them,
+        //  the anti-slashes in front of them are just removed,
+        //  and so the JSON strings with double-quotes become invalid JSON.
+        //  ex: In `INSERT INTO (...) VALUES ('{"key": "L\\'oiseau", "test": "some string with \\"double quote"}')`
+        //      it becomes: `INSERT INTO (...) VALUES ('{"key": "L'oiseau", "test": "some string with "double quote"}')`
+        //      which is invalid JSON.
         rowSql.push(
           `${
             columnContent instanceof Date
@@ -353,7 +360,7 @@ class ClickhouseBatchClient {
                 : typeof columnContent === "number"
                   ? columnContent
                   : typeof columnContent === "string"
-                    ? `'${columnContent.replace(/'/g, "\\'")}'`
+                    ? `'${columnContent.replace(/'/g, "\\'").replace(/"/g, '\\"')}'`
                     : columnContent === true
                       ? "1"
                       : "0"
@@ -589,8 +596,8 @@ class ClickhouseBatchClient {
         query: `SELECT * FROM ${tableName} LIMIT 1`,
       });
       return true;
-    } catch(err) {
-      error(`Cannot select ${tableName}: ${err}`)
+    } catch (err) {
+      error(`Cannot select ${tableName}: ${err}`);
       return false;
     }
   }
